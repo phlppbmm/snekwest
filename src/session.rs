@@ -317,8 +317,8 @@ impl Session {
         Ok(request)
     }
 
-    fn serialize_json_body(&self, json_value: &PyObject) -> PyResult<String> {
-        Python::with_gil(|py| {
+    fn serialize_json_body(&self, json_value: &Py<PyAny>) -> PyResult<String> {
+        Python::attach(|py| {
             let rust_value: serde_json::Value = depythonize(json_value.bind(py)).map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                     "Failed to convert Python object to JSON: {}",
@@ -442,6 +442,8 @@ impl Session {
     }
 
     /// Perform a single HTTP request (no redirect following).
+    /// Releases the GIL during the network call to avoid deadlocks with
+    /// Python-based HTTP servers (e.g. httpbin in tests).
     fn execute_single_request(
         &self,
         client: &Client,
@@ -456,7 +458,10 @@ impl Session {
             self.build_request(client, method, url, params, cookies, auth, extra_headers)?;
         let request = self.apply_body_and_timeout(request, params)?;
 
-        request.send().map_err(map_reqwest_error)
+        // Release the GIL so Python-based servers (httpbin etc.) can process
+        Python::attach(|py| {
+            py.detach(|| request.send().map_err(map_reqwest_error))
+        })
     }
 
     fn do_request(&self, params: RequestParams) -> PyResult<Response> {
@@ -715,7 +720,7 @@ impl Session {
         url: String,
         params: Option<HashMap<String, String>>,
         data: Option<DataParameter>,
-        json: Option<PyObject>,
+        json: Option<Py<PyAny>>,
         headers: Option<HashMap<String, String>>,
         cookies: Option<HashMap<String, String>>,
         files: Option<HashMap<String, String>>,

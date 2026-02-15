@@ -9,7 +9,7 @@ pub struct RequestParams {
     pub url: String,
     pub params: Option<HashMap<String, String>>,
     pub data: Option<DataParameter>,
-    pub json: Option<PyObject>,
+    pub json: Option<Py<PyAny>>,
     pub headers: Option<HashMap<String, String>>,
     pub cookies: Option<HashMap<String, String>>,
     pub files: Option<HashMap<String, String>>,
@@ -28,7 +28,7 @@ impl RequestParams {
         url: String,
         params: Option<HashMap<String, String>>,
         data: Option<DataParameter>,
-        json: Option<PyObject>,
+        json: Option<Py<PyAny>>,
         headers: Option<HashMap<String, String>>,
         cookies: Option<HashMap<String, String>>,
         files: Option<HashMap<String, String>>,
@@ -66,18 +66,20 @@ pub enum DataParameter {
     Raw(Vec<u8>),
 }
 
-impl<'py> FromPyObject<'py> for DataParameter {
-    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-        if let Ok(dict) = ob.downcast::<PyDict>() {
+impl<'a, 'py> FromPyObject<'a, 'py> for DataParameter {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(dict) = ob.cast::<PyDict>() {
             let map: HashMap<String, String> = dict.extract()?;
             return Ok(DataParameter::Form(map));
         }
 
-        if let Ok(s) = ob.downcast::<PyString>() {
+        if let Ok(s) = ob.cast::<PyString>() {
             return Ok(DataParameter::Raw(s.to_string().into_bytes()));
         }
 
-        if let Ok(bytes) = ob.downcast::<PyBytes>() {
+        if let Ok(bytes) = ob.cast::<PyBytes>() {
             return Ok(DataParameter::Raw(bytes.as_bytes().to_vec()));
         }
 
@@ -93,28 +95,30 @@ pub enum TimeoutParameter {
     Pair(Option<f64>, Option<f64>),
 }
 
-impl<'py> FromPyObject<'py> for TimeoutParameter {
-    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-        if let Ok(f) = ob.downcast::<PyFloat>() {
+impl<'a, 'py> FromPyObject<'a, 'py> for TimeoutParameter {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(f) = ob.cast::<PyFloat>() {
             return Ok(TimeoutParameter::Single(f.extract()?));
         }
 
-        if let Ok(i) = ob.downcast::<PyInt>() {
+        if let Ok(i) = ob.cast::<PyInt>() {
             return Ok(TimeoutParameter::Single(i.extract::<f64>()?));
         }
 
-        if let Ok(tuple) = ob.downcast::<PyTuple>() {
+        if let Ok(tuple) = ob.cast::<PyTuple>() {
             if tuple.len() == 2 {
                 let first = tuple.get_item(0)?;
                 let second = tuple.get_item(1)?;
 
-                let connect: Option<f64> = if first.downcast::<PyNone>().is_ok() {
+                let connect: Option<f64> = if first.cast::<PyNone>().is_ok() {
                     None
                 } else {
                     Some(first.extract()?)
                 };
 
-                let read: Option<f64> = if second.downcast::<PyNone>().is_ok() {
+                let read: Option<f64> = if second.cast::<PyNone>().is_ok() {
                     None
                 } else {
                     Some(second.extract()?)
@@ -142,13 +146,15 @@ pub enum CertParameter {
     Pair(String, String),
 }
 
-impl<'py> FromPyObject<'py> for CertParameter {
-    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-        if let Ok(s) = ob.downcast::<PyString>() {
+impl<'a, 'py> FromPyObject<'a, 'py> for CertParameter {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(s) = ob.cast::<PyString>() {
             return Ok(CertParameter::Single(s.to_string()));
         }
 
-        if let Ok(tuple) = ob.downcast::<PyTuple>() {
+        if let Ok(tuple) = ob.cast::<PyTuple>() {
             if tuple.len() == 2 {
                 let first: String = tuple.get_item(0)?.extract()?;
                 let second: String = tuple.get_item(1)?.extract()?;
