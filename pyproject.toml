@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A blazingly fast, memory-safe HTTP client ecosystem for Python, powered by Rust's reqwest."
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = ["maturin>=1.8.6", "patchelf>=0.17.2.2"]
+dependencies = []
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -31,4 +31,12 @@ exclude = ["python-requests/"]
 exclude = ["python-requests/"]
 
 [dependency-groups]
-dev = ["pytest>=8.3.5"]
+dev = [
+    "pytest>=8.3.5",
+    "pytest-httpbin>=2.1.0",
+    "pylint",
+    "pyright",
+    "mypy",
+    "ty",
+    "ruff",
+]
