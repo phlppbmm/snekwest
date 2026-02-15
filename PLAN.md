@@ -5,16 +5,16 @@
 Alles auf die Rust-Seite verschieben. Python-Schicht wird zum dünnen API-Shim.
 Getestet wird gegen die `requests`-Testsuite (`python-requests/tests/`).
 
-## Aktueller Zustand (nach Step 11)
+## Aktueller Zustand (nach Streaming + Netrc Fix)
 
-- 327/332 python-requests Tests passen (3 Failures)
+- 329/332 python-requests Tests passen (1 Failure: test_response_iter_lines)
 - 51/51 eigene Tests passen
 - Step 1 (Redirect-Logik) ✅
 - Step 2 (Error-Mapping) ✅
 - Step 3 (Proxy-Support) ✅
 - Step 4 (SSL/TLS CA-Bundle + mTLS + Poolmanager) ✅
-- Step 5 (Streaming: context_manager, close) ✅ (iter_lines braucht Phase 3)
-- Step 8 (URL Validation: userinfo stripping) ✅
+- Step 5 (Streaming: context_manager, close, DIGEST_STREAM) ✅ (iter_lines braucht Phase 3)
+- Step 8 (URL Validation: userinfo stripping, netrc auth) ✅
 - Step 11 (Retries, gzip redirect, raw.headers) ✅
 - Python-Adapter ruft Rust mit `allow_redirects=False` auf
 - Python reimplementiert: Redirects, Cookies, Auth, Body-Encoding, Header-Merging

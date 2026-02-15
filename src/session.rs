@@ -716,7 +716,6 @@ impl Session {
         builder = builder.redirect(reqwest::redirect::Policy::none());
 
         // Note: reqwest auto-decompression is kept enabled (gzip, deflate, brotli).
-        // For streaming endpoints, body reading is skipped in Rust (see is_stream).
 
         if let Some(ct_ms) = config.connect_timeout_ms {
             builder = builder.connect_timeout(std::time::Duration::from_millis(ct_ms));
@@ -803,7 +802,6 @@ impl Session {
         );
 
         let has_proxies = params.proxies.as_ref().map_or(false, |p| !p.is_empty());
-        let is_stream = params.stream.unwrap_or(false);
 
         let original_method = params.method.clone();
         let request_url = params.url.clone();
@@ -1038,10 +1036,13 @@ impl Session {
             let reason = reason_phrase(status);
             let resp_url = response.url().to_string();
 
-            // For streaming requests, skip eager body reading to avoid hangs
-            // (server may not close connection promptly). Python handles body
-            // reading lazily via iter_content/iter_lines.
-            let body = if is_stream {
+            // For streaming requests with chunked transfer (no Content-Length),
+            // skip body reading to avoid hangs — the server may not close the
+            // connection promptly.  Non-chunked streaming (has Content-Length)
+            // is safe to read eagerly.
+            let is_stream = params.stream.unwrap_or(false);
+            let has_content_length = response.headers().contains_key("content-length");
+            let body = if is_stream && !has_content_length {
                 Vec::new()
             } else {
                 response.bytes().unwrap_or_default().to_vec()

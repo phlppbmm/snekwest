@@ -292,6 +292,14 @@ class HTTPAdapter(BaseAdapter):
         # Extract prepared request data
         method = request.method
         url = request.url
+        # Strip userinfo from URL to prevent reqwest from using it as
+        # basic auth credentials (auth is handled by PreparedRequest headers).
+        parsed = urlparse(url)
+        if parsed.username is not None or parsed.password is not None:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            url = parsed._replace(netloc=netloc).geturl()
         # Convert all header keys/values to native strings for Rust
         headers = None
         if request.headers:
@@ -401,10 +409,16 @@ class HTTPAdapter(BaseAdapter):
 
         resp = self.build_response(request, rust_response)
 
-        # When streaming, mark content as not consumed so callers
-        # can iterate lazily (or close without reading).
         if stream:
+            # Streaming: body available through raw, not yet "consumed"
             resp._content_consumed = False
+            # Reset _content so it's lazily loaded on first .content access
+            resp._content = False
+        else:
+            # Non-streaming: body already in _content, mark raw as exhausted
+            # so raw.read() returns b"" (matching urllib3 behavior)
+            if resp.raw:
+                resp.raw.seek(0, 2)
 
         return resp
 
