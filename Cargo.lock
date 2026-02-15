@@ -6,10 +6,12 @@ version = 4
 name = "_bindings"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "pyo3",
  "pythonize",
  "reqwest",
  "serde_json",
+ "url",
 ]
 
 [[package]]

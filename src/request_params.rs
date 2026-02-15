@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyString, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyNone, PyString, PyTuple};
 use std::collections::HashMap;
 
 #[pyclass]
@@ -7,12 +7,12 @@ use std::collections::HashMap;
 pub struct RequestParams {
     pub method: String,
     pub url: String,
-    pub params: Option<HashMap<String, String>>, // # TODO: simplified arg
-    pub data: Option<DataParameter>,             // # TODO: simplified arg
+    pub params: Option<HashMap<String, String>>,
+    pub data: Option<DataParameter>,
     pub json: Option<PyObject>,
     pub headers: Option<HashMap<String, String>>,
     pub cookies: Option<HashMap<String, String>>,
-    pub files: Option<HashMap<String, String>>, // # TODO: simplified arg
+    pub files: Option<HashMap<String, String>>,
     pub auth: Option<(String, String)>,
     pub timeout: Option<TimeoutParameter>,
     pub allow_redirects: bool,
@@ -23,7 +23,6 @@ pub struct RequestParams {
 }
 
 impl RequestParams {
-    // Constructor that mirrors requests.Session.request signature
     pub fn from_args(
         method: String,
         url: String,
@@ -52,7 +51,7 @@ impl RequestParams {
             files,
             auth,
             timeout,
-            allow_redirects: allow_redirects.unwrap_or(true), // Default like requests
+            allow_redirects: allow_redirects.unwrap_or(true),
             proxies,
             stream,
             verify,
@@ -69,18 +68,15 @@ pub enum DataParameter {
 
 impl<'py> FromPyObject<'py> for DataParameter {
     fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-        // Try dict for form data
         if let Ok(dict) = ob.downcast::<PyDict>() {
             let map: HashMap<String, String> = dict.extract()?;
             return Ok(DataParameter::Form(map));
         }
 
-        // Try string
         if let Ok(s) = ob.downcast::<PyString>() {
             return Ok(DataParameter::Raw(s.to_string().into_bytes()));
         }
 
-        // Try bytes
         if let Ok(bytes) = ob.downcast::<PyBytes>() {
             return Ok(DataParameter::Raw(bytes.as_bytes().to_vec()));
         }
@@ -94,7 +90,7 @@ impl<'py> FromPyObject<'py> for DataParameter {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimeoutParameter {
     Single(f64),
-    Pair(f64, f64),
+    Pair(Option<f64>, Option<f64>),
 }
 
 impl<'py> FromPyObject<'py> for TimeoutParameter {
@@ -109,13 +105,33 @@ impl<'py> FromPyObject<'py> for TimeoutParameter {
 
         if let Ok(tuple) = ob.downcast::<PyTuple>() {
             if tuple.len() == 2 {
-                let first: f64 = tuple.get_item(0)?.extract()?;
-                let second: f64 = tuple.get_item(1)?.extract()?;
-                return Ok(TimeoutParameter::Pair(first, second));
+                let first = tuple.get_item(0)?;
+                let second = tuple.get_item(1)?;
+
+                let connect: Option<f64> = if first.downcast::<PyNone>().is_ok() {
+                    None
+                } else {
+                    Some(first.extract()?)
+                };
+
+                let read: Option<f64> = if second.downcast::<PyNone>().is_ok() {
+                    None
+                } else {
+                    Some(second.extract()?)
+                };
+
+                return Ok(TimeoutParameter::Pair(connect, read));
             }
+
+            // 3+ element tuple is invalid
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Timeout value connect is invalid. It must be a (connect, read) tuple.",
+            ));
         }
-        Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            "Expected float or tuple of two floats",
+
+        // String or other type
+        Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Timeout value must be an int, float or None",
         ))
     }
 }

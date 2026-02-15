@@ -13,15 +13,52 @@ pub struct Response {
     #[pyo3(get)]
     pub headers: HashMap<String, String>,
     body: Arc<Vec<u8>>,
+    #[pyo3(get)]
+    pub elapsed_ms: f64,
+    #[pyo3(get)]
+    pub history: Vec<Response>,
+    #[pyo3(get)]
+    pub cookies: HashMap<String, String>,
+    #[pyo3(get)]
+    pub reason: Option<String>,
+    #[pyo3(get)]
+    pub is_redirect: bool,
+    #[pyo3(get)]
+    pub method: String,
+    #[pyo3(get)]
+    pub request_url: String,
+    #[pyo3(get)]
+    pub request_headers: HashMap<String, String>,
 }
 
 impl Response {
-    pub fn new(status: u16, url: String, headers: HashMap<String, String>, body: Vec<u8>) -> Self {
+    pub fn new(
+        status: u16,
+        url: String,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+        elapsed_ms: f64,
+        history: Vec<Response>,
+        cookies: HashMap<String, String>,
+        reason: Option<String>,
+        is_redirect: bool,
+        method: String,
+        request_url: String,
+        request_headers: HashMap<String, String>,
+    ) -> Self {
         Self {
             status,
             url,
             headers,
             body: Arc::new(body),
+            elapsed_ms,
+            history,
+            cookies,
+            reason,
+            is_redirect,
+            method,
+            request_url,
+            request_headers,
         }
     }
 }

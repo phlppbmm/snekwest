@@ -4,17 +4,177 @@ use reqwest::blocking::{Client, ClientBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 
+use crate::exceptions;
 use crate::request_params::CertParameter;
 use crate::request_params::{DataParameter, RequestParams, TimeoutParameter};
 use crate::response::Response;
+
+const MAX_REDIRECTS: usize = 30;
+
+fn reason_phrase(status: u16) -> Option<String> {
+    let phrase = match status {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => return None,
+    };
+    Some(phrase.to_string())
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Validate the URL and raise the appropriate Python exception for invalid URLs.
+fn validate_url(url: &str) -> PyResult<()> {
+    // Empty or whitespace-only
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err(PyErr::new::<exceptions::InvalidURL, _>(
+            format!("Invalid URL {}: No host supplied", repr_str(url)),
+        ));
+    }
+
+    // Check for scheme
+    if let Some(colon_pos) = trimmed.find(':') {
+        let scheme = &trimmed[..colon_pos];
+        // Check if scheme is a valid URL scheme (only letters, digits, +, -, .)
+        let is_valid_scheme = !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
+
+        if is_valid_scheme {
+            let lower_scheme = scheme.to_lowercase();
+            if lower_scheme != "http" && lower_scheme != "https" {
+                return Err(PyErr::new::<exceptions::InvalidSchema, _>(format!(
+                    "No connection adapters were found for {:?}",
+                    url
+                )));
+            }
+
+            // Has http/https scheme - check for valid host
+            let after_scheme = &trimmed[colon_pos + 1..];
+            let after_slashes = after_scheme.trim_start_matches('/');
+
+            if after_slashes.is_empty() {
+                return Err(PyErr::new::<exceptions::InvalidURL, _>(
+                    format!("Invalid URL {:?}: No host supplied", url),
+                ));
+            }
+
+            // Check for invalid characters in hostname
+            let host = after_slashes.split('/').next().unwrap_or("");
+            let host_no_port = host.split(':').next().unwrap_or("");
+            if host_no_port.starts_with('*') || host_no_port.starts_with('.') {
+                return Err(PyErr::new::<exceptions::InvalidURL, _>(format!(
+                    "Invalid URL {:?}: Invalid host",
+                    url
+                )));
+            }
+
+            return Ok(());
+        }
+    }
+
+    // No valid scheme found - check if it looks like host:port (InvalidSchema)
+    // or just a bare word (MissingSchema)
+    if trimmed.contains(':') || trimmed.contains('/') {
+        // Looks like host:port or host/path without a scheme
+        return Err(PyErr::new::<exceptions::InvalidSchema, _>(format!(
+            "No connection adapters were found for {:?}",
+            url
+        )));
+    }
+
+    Err(PyErr::new::<exceptions::MissingSchema, _>(format!(
+        "Invalid URL {:?}: No scheme supplied. Perhaps you meant \"https://{}\"?",
+        url, url
+    )))
+}
+
+fn repr_str(s: &str) -> String {
+    format!("'{}'", s)
+}
+
+/// Map a reqwest error to the appropriate Python exception.
+fn map_reqwest_error(e: reqwest::Error) -> PyErr {
+    let msg = e.to_string();
+
+    if e.is_timeout() {
+        if e.is_connect() {
+            return PyErr::new::<exceptions::ConnectTimeout, _>(msg);
+        }
+        // Check if it's a read timeout based on message
+        if msg.contains("read") || msg.contains("operation timed out") {
+            return PyErr::new::<exceptions::ReadTimeout, _>(msg);
+        }
+        return PyErr::new::<exceptions::ReadTimeout, _>(msg);
+    }
+
+    if e.is_connect() {
+        // Check for SSL/TLS errors
+        if msg.contains("certificate")
+            || msg.contains("SSL")
+            || msg.contains("TLS")
+            || msg.contains("tls")
+            || msg.contains("ssl")
+            || msg.contains("CertificateRequired")
+            || msg.contains("InvalidCertificate")
+        {
+            return PyErr::new::<exceptions::SSLError, _>(msg);
+        }
+        return PyErr::new::<exceptions::ConnectionError, _>(msg);
+    }
+
+    if e.is_redirect() {
+        return PyErr::new::<exceptions::TooManyRedirects, _>(msg);
+    }
+
+    // General connection errors
+    if msg.contains("certificate")
+        || msg.contains("SSL")
+        || msg.contains("TLS")
+        || msg.contains("tls")
+        || msg.contains("ssl")
+        || msg.contains("InvalidCertificate")
+    {
+        return PyErr::new::<exceptions::SSLError, _>(msg);
+    }
+
+    if msg.contains("dns") || msg.contains("resolve") || msg.contains("No such host") {
+        return PyErr::new::<exceptions::ConnectionError, _>(msg);
+    }
+
+    PyErr::new::<exceptions::ConnectionError, _>(msg)
+}
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct ClientConfig {
     verify: bool,
     cert_hash: Option<String>,
     proxy_hash: Option<String>,
-    allow_redirects: bool,
 }
 
 impl ClientConfig {
@@ -23,7 +183,6 @@ impl ClientConfig {
             verify: params.verify.unwrap_or(true),
             cert_hash: params.cert.as_ref().map(|c| format!("{:?}", c)),
             proxy_hash: params.proxies.as_ref().map(|p| format!("{:?}", p)),
-            allow_redirects: params.allow_redirects,
         }
     }
 }
@@ -32,6 +191,14 @@ impl ClientConfig {
 pub struct Session {
     clients: Mutex<HashMap<ClientConfig, Arc<Client>>>,
     cookie_jar: Mutex<HashMap<String, String>>,
+    #[pyo3(get, set)]
+    max_redirects: usize,
+    #[pyo3(get, set)]
+    default_headers: Option<HashMap<String, String>>,
+    #[pyo3(get, set)]
+    default_auth: Option<(String, String)>,
+    #[pyo3(get, set)]
+    default_params: Option<HashMap<String, String>>,
 }
 
 impl Session {
@@ -64,20 +231,38 @@ impl Session {
     fn build_request(
         &self,
         client: &Client,
+        method: &str,
+        url: &str,
         params: &RequestParams,
         cookies: &HashMap<String, String>,
+        auth: &Option<(String, String)>,
+        extra_headers: &Option<HashMap<String, String>>,
     ) -> PyResult<reqwest::blocking::RequestBuilder> {
         let mut request = client.request(
-            params.method.parse().map_err(|_| {
+            method.parse().map_err(|_| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid HTTP method")
             })?,
-            &params.url,
+            url,
         );
 
+        // Merge default params with request params
+        let mut merged_params: HashMap<String, String> = HashMap::new();
+        if let Some(default_params) = &self.default_params {
+            merged_params.extend(default_params.clone());
+        }
         if let Some(query_params) = &params.params {
-            request = request.query(query_params);
+            merged_params.extend(query_params.clone());
+        }
+        if !merged_params.is_empty() {
+            request = request.query(&merged_params);
         }
 
+        // Merge default headers with request headers
+        if let Some(default_headers) = extra_headers {
+            for (key, value) in default_headers {
+                request = request.header(key, value);
+            }
+        }
         if let Some(headers) = &params.headers {
             for (key, value) in headers {
                 request = request.header(key, value);
@@ -93,7 +278,8 @@ impl Session {
             request = request.header("Cookie", cookie_header);
         }
 
-        if let Some((username, password)) = &params.auth {
+        // Use request auth, then session default auth
+        if let Some((username, password)) = auth {
             request = request.basic_auth(username, Some(password));
         }
 
@@ -113,7 +299,6 @@ impl Session {
         } else if let Some(files) = &params.files {
             let mut form = reqwest::blocking::multipart::Form::new();
             for (field_name, file_path) in files {
-                // TODO: This is simplified - real implementation should read file contents
                 form = form.text(field_name.clone(), file_path.clone());
             }
             request = request.multipart(form);
@@ -154,14 +339,27 @@ impl Session {
         match timeout_params {
             TimeoutParameter::Single(secs) => std::time::Duration::from_secs_f64(*secs),
             TimeoutParameter::Pair(connect_timeout, read_timeout) => {
-                // Use the larger timeout for total request timeout
-                // In a more sophisticated implementation, you'd handle these separately
-                std::time::Duration::from_secs_f64(connect_timeout.max(*read_timeout))
+                // Use the smaller non-None timeout, or the available one
+                match (connect_timeout, read_timeout) {
+                    (Some(c), Some(r)) => std::time::Duration::from_secs_f64(c.max(*r)),
+                    (Some(c), None) => std::time::Duration::from_secs_f64(*c),
+                    (None, Some(r)) => std::time::Duration::from_secs_f64(*r),
+                    (None, None) => std::time::Duration::from_secs(300), // 5 min default
+                }
             }
         }
     }
 
-    fn update_session_cookies(&self, response: &reqwest::blocking::Response) {
+    fn update_session_cookies(
+        &self,
+        response: &reqwest::blocking::Response,
+        request_had_cookies: bool,
+    ) {
+        // Don't update session cookies if the request had per-request cookies
+        if request_had_cookies {
+            return;
+        }
+
         let mut jar = self.cookie_jar.lock().unwrap();
 
         for (name, value) in response.headers() {
@@ -174,38 +372,56 @@ impl Session {
     }
 
     fn parse_and_store_cookie(&self, jar: &mut HashMap<String, String>, cookie_str: &str) {
-        // cookie parsing TODO: this is simplified
         if let Some(cookie_pair) = cookie_str.split(';').next() {
             if let Some((key, val)) = cookie_pair.split_once('=') {
-                jar.insert(key.trim().to_string(), val.trim().to_string());
+                let key = key.trim().to_string();
+                let val = val.trim().to_string();
+
+                // Check for expired cookies
+                let lower = cookie_str.to_lowercase();
+                if lower.contains("expires=") {
+                    // Check if it's an expiry in the past (epoch-ish)
+                    if lower.contains("1970") || lower.contains("deleted") {
+                        jar.remove(&key);
+                        return;
+                    }
+                }
+                if lower.contains("max-age=0") {
+                    jar.remove(&key);
+                    return;
+                }
+
+                jar.insert(key, val);
             }
         }
     }
 
-    fn extract_response_data(
-        &self,
-        response: reqwest::blocking::Response,
-        stream: bool,
-    ) -> PyResult<Response> {
-        let status = response.status().as_u16();
-        let url = response.url().to_string();
-        let headers: HashMap<String, String> = response
+    fn extract_response_headers(
+        response: &reqwest::blocking::Response,
+    ) -> HashMap<String, String> {
+        response
             .headers()
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
+            .collect()
+    }
 
-        let body = if stream {
-            // TODO: this is simplified
-            Vec::new()
-        } else {
-            response
-                .bytes()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-                .to_vec()
-        };
-
-        Ok(Response::new(status, url, headers, body))
+    fn extract_response_cookies(
+        response: &reqwest::blocking::Response,
+    ) -> HashMap<String, String> {
+        let mut cookies = HashMap::new();
+        for (name, value) in response.headers() {
+            if name.as_str().to_lowercase() == "set-cookie" {
+                if let Ok(cookie_str) = value.to_str() {
+                    if let Some(cookie_pair) = cookie_str.split(';').next() {
+                        if let Some((key, val)) = cookie_pair.split_once('=') {
+                            cookies.insert(key.trim().to_string(), val.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        cookies
     }
 
     fn create_client_for_config(&self, config: &ClientConfig) -> PyResult<Arc<Client>> {
@@ -215,18 +431,249 @@ impl Session {
             builder = builder.danger_accept_invalid_certs(true);
         }
 
-        if !config.allow_redirects {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
-        }
-
-        // Configure SSL certificate TODO: this is simplified
-        // Configure proxy TODO: this is simplified
+        // Always disable automatic redirects - we handle them manually
+        builder = builder.redirect(reqwest::redirect::Policy::none());
 
         let client = builder
             .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(Arc::new(client))
+    }
+
+    /// Perform a single HTTP request (no redirect following).
+    fn execute_single_request(
+        &self,
+        client: &Client,
+        method: &str,
+        url: &str,
+        params: &RequestParams,
+        cookies: &HashMap<String, String>,
+        auth: &Option<(String, String)>,
+        extra_headers: &Option<HashMap<String, String>>,
+    ) -> PyResult<reqwest::blocking::Response> {
+        let request =
+            self.build_request(client, method, url, params, cookies, auth, extra_headers)?;
+        let request = self.apply_body_and_timeout(request, params)?;
+
+        request.send().map_err(map_reqwest_error)
+    }
+
+    fn do_request(&self, params: RequestParams) -> PyResult<Response> {
+        let client = self.get_or_create_client(&params)?;
+        let start = Instant::now();
+
+        let original_method = params.method.clone();
+        let request_url = params.url.clone();
+        let has_request_cookies = params.cookies.is_some();
+
+        // Determine auth: request auth overrides session auth
+        let auth = params.auth.clone().or_else(|| self.default_auth.clone());
+
+        // Merge default headers
+        let extra_headers = self.default_headers.clone();
+
+        // Build merged cookies for the first request
+        let merged_cookies = self.merge_cookies(&params);
+
+        // Collect request headers for the Request object on the final response
+        // We'll capture them from the first redirect step
+        let mut current_method = original_method.clone();
+        let mut current_url = request_url.clone();
+        let mut history: Vec<Response> = Vec::new();
+        let mut current_cookies = merged_cookies;
+        let current_auth = auth.clone();
+        let max_redirects = if params.allow_redirects {
+            self.max_redirects
+        } else {
+            0
+        };
+
+        // Track request headers for each hop
+        #[allow(unused_assignments)]
+        let mut final_request_headers: HashMap<String, String> = HashMap::new();
+
+        loop {
+            // Build the actual request headers we'll send
+            let mut req_headers: HashMap<String, String> = HashMap::new();
+            if let Some(ref h) = extra_headers {
+                req_headers.extend(h.clone());
+            }
+            if let Some(ref h) = params.headers {
+                req_headers.extend(h.clone());
+            }
+            if let Some((ref u, ref p)) = current_auth {
+                // Basic auth header
+                use base64::Engine;
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p));
+                req_headers.insert("Authorization".to_string(), format!("Basic {}", encoded));
+            }
+
+            // Track request headers for each hop
+            final_request_headers = req_headers.clone();
+
+            let response = self.execute_single_request(
+                &client,
+                &current_method,
+                &current_url,
+                &params,
+                &current_cookies,
+                &current_auth,
+                &extra_headers,
+            )?;
+
+            let status = response.status().as_u16();
+            let is_redir = is_redirect_status(status);
+
+            // Update session cookies from response
+            self.update_session_cookies(&response, has_request_cookies);
+
+            // Update current cookies with any new cookies from this response
+            for (name, value) in response.headers() {
+                if name.as_str().to_lowercase() == "set-cookie" {
+                    if let Ok(cookie_str) = value.to_str() {
+                        if let Some(cookie_pair) = cookie_str.split(';').next() {
+                            if let Some((key, val)) = cookie_pair.split_once('=') {
+                                current_cookies
+                                    .insert(key.trim().to_string(), val.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if is_redir && params.allow_redirects {
+                if history.len() >= max_redirects {
+                    // Build a partial response for the TooManyRedirects error
+                    return Err(PyErr::new::<exceptions::TooManyRedirects, _>(format!(
+                        "Exceeded {} redirects.",
+                        max_redirects
+                    )));
+                }
+
+                // Get redirect location
+                let location = response
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+
+                let resp_headers = Self::extract_response_headers(&response);
+                let resp_cookies = Self::extract_response_cookies(&response);
+                let reason = reason_phrase(status);
+                let resp_url = response.url().to_string();
+
+                // Read body for intermediate response
+                let body = response.bytes().unwrap_or_default().to_vec();
+
+                // Build intermediate response for history
+                let intermediate = Response::new(
+                    status,
+                    resp_url,
+                    resp_headers,
+                    body,
+                    0.0, // elapsed not relevant for intermediates
+                    Vec::new(),
+                    resp_cookies,
+                    reason,
+                    true,
+                    current_method.clone(),
+                    current_url.clone(),
+                    req_headers.clone(),
+                );
+                history.push(intermediate);
+
+                if let Some(loc) = location {
+                    // Resolve relative URLs
+                    current_url = if loc.starts_with("http://") || loc.starts_with("https://") {
+                        loc
+                    } else if loc.starts_with("HTTP://") || loc.starts_with("HTTPS://") {
+                        loc
+                    } else if loc.starts_with('/') {
+                        // Absolute path - combine with current URL's scheme+host
+                        if let Ok(base) = url::Url::parse(&current_url) {
+                            format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), loc)
+                        } else {
+                            loc
+                        }
+                    } else {
+                        // Relative path
+                        if let Ok(base) = url::Url::parse(&current_url) {
+                            base.join(&loc).map(|u| u.to_string()).unwrap_or(loc)
+                        } else {
+                            loc
+                        }
+                    };
+
+                    // Maintain fragment from original URL
+                    if let Some(frag_pos) = request_url.find('#') {
+                        let fragment = &request_url[frag_pos..];
+                        if !current_url.contains('#') {
+                            current_url.push_str(fragment);
+                        }
+                    }
+
+                    // 301, 302, 303: POST -> GET (but HEAD stays HEAD)
+                    if matches!(status, 301 | 302 | 303) && current_method.to_uppercase() != "HEAD"
+                    {
+                        current_method = "GET".to_string();
+                    }
+                    // 307, 308: method stays the same
+                } else {
+                    // No location header, stop redirecting
+                    break;
+                }
+                continue;
+            }
+
+            // Final response
+            let resp_headers = Self::extract_response_headers(&response);
+            let resp_cookies = Self::extract_response_cookies(&response);
+            let reason = reason_phrase(status);
+            let resp_url = response.url().to_string();
+
+            let body = response
+                .bytes()
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?
+                .to_vec();
+
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            // For the final response, update final_request_headers
+            final_request_headers = req_headers;
+
+            // Append fragment to URL if present in original request
+            let mut final_url = resp_url;
+            if let Some(frag_pos) = request_url.find('#') {
+                let fragment = &request_url[frag_pos..];
+                if !final_url.contains('#') {
+                    final_url.push_str(fragment);
+                }
+            }
+
+            return Ok(Response::new(
+                status,
+                final_url,
+                resp_headers,
+                body,
+                elapsed_ms,
+                history,
+                resp_cookies,
+                reason,
+                is_redir,
+                current_method,
+                request_url,
+                final_request_headers,
+            ));
+        }
+
+        // Should not be reached, but just in case
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Unexpected end of redirect chain",
+        ))
     }
 }
 
@@ -237,6 +684,10 @@ impl Session {
         Session {
             clients: Mutex::new(HashMap::new()),
             cookie_jar: Mutex::new(HashMap::new()),
+            max_redirects: MAX_REDIRECTS,
+            default_headers: None,
+            default_auth: None,
+            default_params: None,
         }
     }
 
@@ -276,6 +727,9 @@ impl Session {
         verify: Option<bool>,
         cert: Option<CertParameter>,
     ) -> PyResult<Response> {
+        // Validate URL first
+        validate_url(&url)?;
+
         let params = RequestParams::from_args(
             method,
             url,
@@ -294,18 +748,7 @@ impl Session {
             cert,
         );
 
-        let client: Arc<Client> = self.get_or_create_client(&params)?;
-        let merged_cookies: HashMap<String, String> = self.merge_cookies(&params);
-        let mut request: reqwest::blocking::RequestBuilder =
-            self.build_request(&client, &params, &merged_cookies)?;
-        request = self.apply_body_and_timeout(request, &params)?;
-
-        let response = request
-            .send()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-        self.update_session_cookies(&response);
-        self.extract_response_data(response, params.stream.unwrap_or(false))
+        self.do_request(params)
     }
 
     fn close(&self) {
@@ -323,5 +766,15 @@ impl Session {
     fn set_cookies(&self, cookies: HashMap<String, String>) {
         let mut jar = self.cookie_jar.lock().unwrap();
         jar.extend(cookies);
+    }
+
+    fn set_cookie(&self, key: String, value: String) {
+        let mut jar = self.cookie_jar.lock().unwrap();
+        jar.insert(key, value);
+    }
+
+    fn remove_cookie(&self, key: &str) {
+        let mut jar = self.cookie_jar.lock().unwrap();
+        jar.remove(key);
     }
 }
