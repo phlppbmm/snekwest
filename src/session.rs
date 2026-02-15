@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::exceptions::{raise_exception, raise_nested_exception};
 use crate::request_params::CertParameter;
-use crate::request_params::{DataParameter, RequestParams, TimeoutParameter};
+use crate::request_params::{DataParameter, RequestParams, TimeoutParameter, VerifyParameter};
 use crate::response::Response;
 
 const MAX_REDIRECTS: usize = 30;
@@ -137,8 +137,13 @@ fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
                 ));
             }
 
-            // Check for invalid characters in hostname
-            let host = after_slashes.split('/').next().unwrap_or("");
+            // Extract authority (before first /) and strip userinfo (user:pass@)
+            let authority = after_slashes.split('/').next().unwrap_or("");
+            let host = if let Some(at_pos) = authority.rfind('@') {
+                &authority[at_pos + 1..]
+            } else {
+                authority
+            };
 
             // Detect bare IPv6 addresses (without brackets)
             // e.g. http://fe80::5054:ff:fe5a:fc0 is invalid, should be http://[fe80::...]/
@@ -151,6 +156,13 @@ fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
             }
 
             let host_no_port = host.split(':').next().unwrap_or("");
+            if host_no_port.is_empty() {
+                return Err(raise_exception(
+                    py,
+                    "InvalidURL",
+                    format!("Invalid URL {:?}: No host supplied", url),
+                ));
+            }
             if host_no_port.starts_with('*') || host_no_port.starts_with('.') {
                 return Err(raise_exception(
                     py,
@@ -299,9 +311,27 @@ fn map_reqwest_error(
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum VerifyConfig {
+    /// Standard TLS verification (system CA store)
+    Enabled,
+    /// TLS verification disabled
+    Disabled,
+    /// Custom CA bundle path
+    CaBundle(String),
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum CertConfig {
+    /// Single PEM file containing both cert and key
+    Single(String),
+    /// Separate cert and key files
+    Pair(String, String),
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct ClientConfig {
-    verify: bool,
-    cert_hash: Option<String>,
+    verify: VerifyConfig,
+    cert: Option<CertConfig>,
     /// Sorted list of (scheme, proxy_url) pairs for deterministic hashing
     proxies: Option<Vec<(String, String)>>,
     connect_timeout_ms: Option<u64>,
@@ -319,9 +349,18 @@ impl ClientConfig {
             v.sort();
             v
         });
+        let verify = match &params.verify {
+            Some(VerifyParameter::Bool(false)) => VerifyConfig::Disabled,
+            Some(VerifyParameter::CaBundle(path)) => VerifyConfig::CaBundle(path.clone()),
+            _ => VerifyConfig::Enabled,
+        };
+        let cert = params.cert.as_ref().map(|c| match c {
+            CertParameter::Single(path) => CertConfig::Single(path.clone()),
+            CertParameter::Pair(cert, key) => CertConfig::Pair(cert.clone(), key.clone()),
+        });
         Self {
-            verify: params.verify.unwrap_or(true),
-            cert_hash: params.cert.as_ref().map(|c| format!("{:?}", c)),
+            verify,
+            cert,
             proxies,
             connect_timeout_ms,
         }
@@ -627,12 +666,57 @@ impl Session {
     fn create_client_for_config(&self, config: &ClientConfig) -> PyResult<Arc<Client>> {
         let mut builder = ClientBuilder::new();
 
-        if !config.verify {
-            builder = builder.danger_accept_invalid_certs(true);
+        match &config.verify {
+            VerifyConfig::Disabled => {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+            VerifyConfig::CaBundle(path) => {
+                let cert_pem = std::fs::read(path).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Could not read CA bundle: {}: {}",
+                        path, e
+                    ))
+                })?;
+                let cert = reqwest::Certificate::from_pem(&cert_pem).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Invalid CA certificate in {}: {}",
+                        path, e
+                    ))
+                })?;
+                builder = builder.add_root_certificate(cert);
+            }
+            VerifyConfig::Enabled => {}
+        }
+
+        // Apply client certificate (mTLS) — non-fatal on load failure
+        // (cert is only used for HTTPS; for HTTP requests cert is ignored)
+        if let Some(ref cert_config) = config.cert {
+            let pem_data = match cert_config {
+                CertConfig::Single(path) => std::fs::read(path).ok(),
+                CertConfig::Pair(cert_path, key_path) => {
+                    if let (Ok(mut cert), Ok(key)) =
+                        (std::fs::read(cert_path), std::fs::read(key_path))
+                    {
+                        cert.push(b'\n');
+                        cert.extend(key);
+                        Some(cert)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(pem) = pem_data {
+                if let Ok(identity) = reqwest::Identity::from_pem(&pem) {
+                    builder = builder.identity(identity);
+                }
+            }
         }
 
         // Always disable automatic redirects - we handle them manually
         builder = builder.redirect(reqwest::redirect::Policy::none());
+
+        // Note: reqwest auto-decompression is kept enabled (gzip, deflate, brotli).
+        // For streaming endpoints, body reading is skipped in Rust (see is_stream).
 
         if let Some(ct_ms) = config.connect_timeout_ms {
             builder = builder.connect_timeout(std::time::Duration::from_millis(ct_ms));
@@ -719,6 +803,7 @@ impl Session {
         );
 
         let has_proxies = params.proxies.as_ref().map_or(false, |p| !p.is_empty());
+        let is_stream = params.stream.unwrap_or(false);
 
         let original_method = params.method.clone();
         let request_url = params.url.clone();
@@ -953,12 +1038,14 @@ impl Session {
             let reason = reason_phrase(status);
             let resp_url = response.url().to_string();
 
-            let body = response
-                .bytes()
-                .map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                })?
-                .to_vec();
+            // For streaming requests, skip eager body reading to avoid hangs
+            // (server may not close connection promptly). Python handles body
+            // reading lazily via iter_content/iter_lines.
+            let body = if is_stream {
+                Vec::new()
+            } else {
+                response.bytes().unwrap_or_default().to_vec()
+            };
 
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1045,7 +1132,7 @@ impl Session {
         allow_redirects: Option<bool>,
         proxies: Option<HashMap<String, String>>,
         stream: Option<bool>,
-        verify: Option<bool>,
+        verify: Option<VerifyParameter>,
         cert: Option<CertParameter>,
     ) -> PyResult<Response> {
         // Validate URL first

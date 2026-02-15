@@ -18,7 +18,7 @@ pub struct RequestParams {
     pub allow_redirects: bool,
     pub proxies: Option<HashMap<String, String>>,
     pub stream: Option<bool>,
-    pub verify: Option<bool>,
+    pub verify: Option<VerifyParameter>,
     pub cert: Option<CertParameter>,
 }
 
@@ -37,7 +37,7 @@ impl RequestParams {
         allow_redirects: Option<bool>,
         proxies: Option<HashMap<String, String>>,
         stream: Option<bool>,
-        verify: Option<bool>,
+        verify: Option<VerifyParameter>,
         cert: Option<CertParameter>,
     ) -> Self {
         Self {
@@ -136,6 +136,28 @@ impl<'a, 'py> FromPyObject<'a, 'py> for TimeoutParameter {
         // String or other type
         Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
             "Timeout value must be an int, float or None",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VerifyParameter {
+    Bool(bool),
+    CaBundle(String),
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for VerifyParameter {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(b) = ob.extract::<bool>() {
+            return Ok(VerifyParameter::Bool(b));
+        }
+        if let Ok(s) = ob.cast::<PyString>() {
+            return Ok(VerifyParameter::CaBundle(s.to_string()));
+        }
+        Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "verify must be bool or string path",
         ))
     }
 }
