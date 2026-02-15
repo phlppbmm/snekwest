@@ -233,6 +233,7 @@ fn map_reqwest_error(
     py: Python<'_>,
     e: reqwest::Error,
     had_explicit_connect_timeout: bool,
+    has_proxies: bool,
 ) -> PyErr {
     let msg = full_error_chain(&e);
 
@@ -244,7 +245,7 @@ fn map_reqwest_error(
     // 2. Connection errors that are NOT timeouts (connection refused, reset, etc.)
     if e.is_connect() && !e.is_timeout() {
         let lower = msg.to_lowercase();
-        if lower.contains("proxy") {
+        if has_proxies || lower.contains("proxy") || lower.contains("tunnel") {
             return raise_exception(py, "ProxyError", msg);
         }
         return raise_exception(py, "ConnectionError", msg);
@@ -301,7 +302,8 @@ fn map_reqwest_error(
 struct ClientConfig {
     verify: bool,
     cert_hash: Option<String>,
-    proxy_hash: Option<String>,
+    /// Sorted list of (scheme, proxy_url) pairs for deterministic hashing
+    proxies: Option<Vec<(String, String)>>,
     connect_timeout_ms: Option<u64>,
 }
 
@@ -312,13 +314,75 @@ impl ClientConfig {
             Some(TimeoutParameter::Single(s)) => Some((*s * 1000.0) as u64),
             _ => None,
         };
+        let proxies = params.proxies.as_ref().map(|p| {
+            let mut v: Vec<(String, String)> = p.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            v.sort();
+            v
+        });
         Self {
             verify: params.verify.unwrap_or(true),
             cert_hash: params.cert.as_ref().map(|c| format!("{:?}", c)),
-            proxy_hash: params.proxies.as_ref().map(|p| format!("{:?}", p)),
+            proxies,
             connect_timeout_ms,
         }
     }
+}
+
+/// Validate a proxy URL and return an error for malformed ones.
+/// Mirrors Python requests' check: urlparse the URL and reject if hostname is missing.
+/// Non-URL strings (like bare hostnames) are allowed through — they will fail
+/// at connection time and be reported as ProxyError.
+fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
+    let lower = proxy_url.to_lowercase();
+
+    // Only validate URLs with an http/https scheme
+    let after_scheme = if lower.starts_with("https:") {
+        &proxy_url[6..]
+    } else if lower.starts_with("http:") {
+        &proxy_url[5..]
+    } else {
+        // No recognized scheme — let reqwest handle it.
+        // If DNS fails it becomes ProxyError at connection time.
+        return Ok(());
+    };
+
+    // Must have :// (double slash) after scheme.
+    // Single-slash URLs like "http:/foo" are malformed.
+    if !after_scheme.starts_with("//") {
+        return Err(raise_exception(
+            py,
+            "InvalidProxyURL",
+            "Please check proxy URL. It is malformed and could be missing the host.".to_string(),
+        ));
+    }
+
+    // After "://", extract the authority (before any path)
+    let authority = after_scheme[2..].split('/').next().unwrap_or("");
+
+    // Strip userinfo (user:pass@)
+    let host_port = if let Some(at_pos) = authority.rfind('@') {
+        &authority[at_pos + 1..]
+    } else {
+        authority
+    };
+
+    // Extract host (strip port)
+    let host = if host_port.starts_with('[') {
+        // IPv6 — host is everything up to and including ']'
+        host_port.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+
+    if host.is_empty() {
+        return Err(raise_exception(
+            py,
+            "InvalidProxyURL",
+            "Please check proxy URL. It is malformed and could be missing the host.".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[pyclass]
@@ -574,6 +638,42 @@ impl Session {
             builder = builder.connect_timeout(std::time::Duration::from_millis(ct_ms));
         }
 
+        // Apply proxy configuration
+        if let Some(ref proxies) = config.proxies {
+            // Note: no_proxy() only disables system proxy lookups, not custom proxies.
+            // But it seems to override custom proxies too in some reqwest versions.
+            // So we don't call no_proxy() here.
+            for (scheme, proxy_url) in proxies {
+                // Validate the proxy URL first
+                Python::attach(|py| validate_proxy_url(py, proxy_url))?;
+
+                let proxy = match scheme.to_lowercase().as_str() {
+                    "http" => reqwest::Proxy::http(proxy_url),
+                    "https" => reqwest::Proxy::https(proxy_url),
+                    "all" | "all_proxy" => reqwest::Proxy::all(proxy_url),
+                    _ => continue,
+                };
+                match proxy {
+                    Ok(p) => {
+                        builder = builder.proxy(p);
+                    }
+                    Err(_) => {
+                        // reqwest couldn't parse the proxy URL.
+                        return Python::attach(|py| {
+                            Err(raise_exception(
+                                py,
+                                "ProxyError",
+                                format!(
+                                    "Cannot connect to proxy. Could not resolve proxy: {}",
+                                    proxy_url
+                                ),
+                            ))
+                        });
+                    }
+                }
+            }
+        }
+
         let client = builder
             .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
@@ -594,6 +694,7 @@ impl Session {
         auth: &Option<(String, String)>,
         extra_headers: &Option<HashMap<String, String>>,
         had_explicit_connect_timeout: bool,
+        has_proxies: bool,
     ) -> PyResult<reqwest::blocking::Response> {
         let request =
             self.build_request(client, method, url, params, cookies, auth, extra_headers)?;
@@ -604,7 +705,7 @@ impl Session {
             py.detach(|| {
                 request.send().map_err(|e| e)
             })
-            .map_err(|e| map_reqwest_error(py, e, had_explicit_connect_timeout))
+            .map_err(|e| map_reqwest_error(py, e, had_explicit_connect_timeout, has_proxies))
         })
     }
 
@@ -617,6 +718,7 @@ impl Session {
             Some(TimeoutParameter::Pair(Some(_), _))
         );
 
+        let has_proxies = params.proxies.as_ref().map_or(false, |p| !p.is_empty());
 
         let original_method = params.method.clone();
         let request_url = params.url.clone();
@@ -681,6 +783,7 @@ impl Session {
                 &current_auth,
                 &extra_headers,
                 had_explicit_connect_timeout,
+                has_proxies,
             )?;
 
             let status = response.status().as_u16();
