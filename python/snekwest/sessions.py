@@ -1,19 +1,87 @@
-from typing import Any, Union, Optional
+from typing import Any, Optional, Union
+
 from snekwest._bindings import Response as RustResponse
 from snekwest._bindings import Session as RustSession
 
 from .models import Response
 
 
+class _CookieProxy:
+    """Dict-like proxy for session cookies stored in Rust."""
+
+    def __init__(self, rust_session: RustSession) -> None:
+        self._rust_session = rust_session
+
+    def __getitem__(self, key: str) -> str:
+        cookies = self._rust_session.get_cookies()
+        return cookies[key]
+
+    def __setitem__(self, key: str, value: str) -> None:
+        self._rust_session.set_cookie(key, value)
+
+    def __delitem__(self, key: str) -> None:
+        self._rust_session.remove_cookie(key)
+
+    def __contains__(self, key: object) -> bool:
+        cookies = self._rust_session.get_cookies()
+        return key in cookies
+
+    def __bool__(self) -> bool:
+        return bool(self._rust_session.get_cookies())
+
+    def __len__(self) -> int:
+        return len(self._rust_session.get_cookies())
+
+    def __iter__(self):
+        return iter(self._rust_session.get_cookies())
+
+    def __repr__(self) -> str:
+        return repr(self._rust_session.get_cookies())
+
+    def get(self, key: str, default=None):
+        cookies = self._rust_session.get_cookies()
+        return cookies.get(key, default)
+
+    def items(self):
+        return self._rust_session.get_cookies().items()
+
+    def keys(self):
+        return self._rust_session.get_cookies().keys()
+
+    def values(self):
+        return self._rust_session.get_cookies().values()
+
+    def update(self, other=None, **kwargs):
+        if other:
+            self._rust_session.set_cookies(dict(other))
+        if kwargs:
+            self._rust_session.set_cookies(kwargs)
+
+
 class Session:
     def __init__(self) -> None:
         self._rust_session = RustSession()
+        self.cookies = _CookieProxy(self._rust_session)
+        self.headers: dict[str, str] = {}
+        self.auth: Optional[tuple[str, str]] = None
+        self.params: dict[str, str] = {}
+        self.max_redirects: int = 30
 
     def __enter__(self) -> "Session":
         return self
 
     def __exit__(self, *args) -> None:
+        self.close()
+
+    def close(self) -> None:
         self._rust_session.close()
+
+    def _sync_session_defaults(self) -> None:
+        """Push Python-side defaults into the Rust session."""
+        self._rust_session.default_headers = self.headers if self.headers else None
+        self._rust_session.default_auth = self.auth
+        self._rust_session.default_params = self.params if self.params else None
+        self._rust_session.max_redirects = self.max_redirects
 
     def request(
         self,
@@ -26,7 +94,7 @@ class Session:
         cookies=None,
         files=None,
         auth=None,
-        timeout: Optional[Union[float, tuple[float, float]]] = None,
+        timeout: Optional[Union[float, tuple]] = None,
         allow_redirects: bool = True,
         proxies=None,
         hooks=None,
@@ -35,50 +103,15 @@ class Session:
         cert: Optional[Union[str, tuple[str, str]]] = None,
         json: Optional[Any] = None,
     ) -> Response:
-        """Constructs a :class:`Request <Request>`, prepares it and sends it.
-        Returns :class:`Response <Response>` object.
-
-        :param method: method for the new :class:`Request` object.
-        :param url: URL for the new :class:`Request` object.
-        :param params: (optional) Dictionary or bytes to be sent in the query
-            string for the :class:`Request`.
-        :param data: (optional) Dictionary, list of tuples, bytes, or file-like
-            object to send in the body of the :class:`Request`.
-        :param json: (optional) json to send in the body of the
-            :class:`Request`.
-        :param headers: (optional) Dictionary of HTTP Headers to send with the
-            :class:`Request`.
-        :param cookies: (optional) Dict or CookieJar object to send with the
-            :class:`Request`.
-        :param files: (optional) Dictionary of ``'filename': file-like-objects``
-            for multipart encoding upload.
-        :param auth: (optional) Auth tuple or callable to enable
-            Basic/Digest/Custom HTTP Auth.
-        :param timeout: (optional) How long to wait for the server to send
-            data before giving up, as a float, or a :ref:`(connect timeout,
-            read timeout) <timeouts>` tuple.
-        :type timeout: float or tuple
-        :param allow_redirects: (optional) Set to True by default.
-        :type allow_redirects: bool
-        :param proxies: (optional) Dictionary mapping protocol or protocol and
-            hostname to the URL of the proxy.
-        :param hooks: (optional) Dictionary mapping hook name to one event or
-            list of events, event must be callable.
-        :param stream: (optional) whether to immediately download the response
-            content. Defaults to ``False``.
-        :param verify: (optional) Either a boolean, in which case it controls whether we verify
-            the server's TLS certificate, or a string, in which case it must be a path
-            to a CA bundle to use. Defaults to ``True``. When set to
-            ``False``, requests will accept any TLS certificate presented by
-            the server, and will ignore hostname mismatches and/or expired
-            certificates, which will make your application vulnerable to
-            man-in-the-middle (MitM) attacks. Setting verify to ``False``
-            may be useful during local development or testing.
-        :param cert: (optional) if String, path to ssl client cert file (.pem).
-            If Tuple, ('cert', 'key') pair.
-        :rtype: requests.Response
-        """
         _ = hooks
+
+        # Handle bytes method (e.g. b"GET")
+        if isinstance(method, bytes):
+            method = method.decode("utf-8")
+
+        # Sync session-level defaults to Rust
+        self._sync_session_defaults()
+
         rust_response: RustResponse = self._rust_session.make_request(
             method=method,
             url=url,
@@ -98,3 +131,27 @@ class Session:
         )
 
         return Response(rust_response)
+
+    def get(self, url: str, **kwargs) -> Response:
+        kwargs.setdefault("allow_redirects", True)
+        return self.request("GET", url, **kwargs)
+
+    def options(self, url: str, **kwargs) -> Response:
+        kwargs.setdefault("allow_redirects", True)
+        return self.request("OPTIONS", url, **kwargs)
+
+    def head(self, url: str, **kwargs) -> Response:
+        kwargs.setdefault("allow_redirects", False)
+        return self.request("HEAD", url, **kwargs)
+
+    def post(self, url: str, data=None, json=None, **kwargs) -> Response:
+        return self.request("POST", url, data=data, json=json, **kwargs)
+
+    def put(self, url: str, data=None, **kwargs) -> Response:
+        return self.request("PUT", url, data=data, **kwargs)
+
+    def patch(self, url: str, data=None, **kwargs) -> Response:
+        return self.request("PATCH", url, data=data, **kwargs)
+
+    def delete(self, url: str, **kwargs) -> Response:
+        return self.request("DELETE", url, **kwargs)
