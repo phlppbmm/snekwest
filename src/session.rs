@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::exceptions::raise_exception;
+use crate::exceptions::{raise_exception, raise_nested_exception};
 use crate::request_params::CertParameter;
 use crate::request_params::{DataParameter, RequestParams, TimeoutParameter};
 use crate::response::Response;
@@ -188,14 +188,25 @@ fn repr_str(s: &str) -> String {
     format!("'{}'", s)
 }
 
-fn is_ssl_error_text(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("certificate")
-        || lower.contains("ssl")
-        || lower.contains("tls")
-        || lower.contains("handshake")
-        || lower.contains("unknown issuer")
-        || lower.contains("self signed")
+/// Check if the error originates from an SSL/TLS issue by walking the source chain.
+/// This avoids false positives from URLs containing "ssl" in the path.
+fn is_ssl_error(e: &reqwest::Error) -> bool {
+    use std::error::Error;
+    // Skip the top-level reqwest error (which contains the URL) and check sources
+    let mut source: Option<&dyn Error> = e.source();
+    while let Some(s) = source {
+        let msg = s.to_string().to_lowercase();
+        if msg.contains("certificate")
+            || msg.contains("handshake")
+            || msg.contains("unknown issuer")
+            || msg.contains("self signed")
+            || msg.contains("alertreceived")
+        {
+            return true;
+        }
+        source = s.source();
+    }
+    false
 }
 
 /// Collect the full error chain (including nested source errors) into a single string.
@@ -212,44 +223,77 @@ fn full_error_chain(e: &reqwest::Error) -> String {
 }
 
 /// Map a reqwest error to the appropriate Python exception.
-/// `had_explicit_connect_timeout` is true when the user passed a (connect, read) timeout tuple
-/// with a non-None connect value, signaling that ConnectTimeout should be raised.
-fn map_reqwest_error(py: Python<'_>, e: reqwest::Error, had_explicit_connect_timeout: bool) -> PyErr {
+///
+/// - `had_explicit_connect_timeout`: true when the user passed a (connect, read) timeout tuple
+///   with a non-None connect value, signaling that ConnectTimeout should be raised.
+/// - `connect_timeout_secs`: the connect timeout value in seconds (if any), used to disambiguate
+///   timeout errors that fire during the connect phase when request.timeout races with connect_timeout.
+/// - `elapsed`: how long the request took before the error occurred.
+fn map_reqwest_error(
+    py: Python<'_>,
+    e: reqwest::Error,
+    had_explicit_connect_timeout: bool,
+) -> PyErr {
     let msg = full_error_chain(&e);
 
-    // Check for SSL/TLS errors first — they may appear as connect errors
-    if is_ssl_error_text(&msg) {
+    // 1. SSL/TLS errors — check source chain (not URL text)
+    if is_ssl_error(&e) {
         return raise_exception(py, "SSLError", msg);
     }
 
+    // 2. Connection errors that are NOT timeouts (connection refused, reset, etc.)
+    if e.is_connect() && !e.is_timeout() {
+        let lower = msg.to_lowercase();
+        if lower.contains("proxy") {
+            return raise_exception(py, "ProxyError", msg);
+        }
+        return raise_exception(py, "ConnectionError", msg);
+    }
+
+    // 3. Timeout errors
     if e.is_timeout() {
         if e.is_connect() {
             if had_explicit_connect_timeout {
-                // User explicitly set a connect timeout via (connect, read) tuple
-                return raise_exception(
+                return raise_nested_exception(
                     py,
                     "ConnectTimeout",
                     format!("ConnectTimeout: connection timed out. {}", msg),
                 );
             }
-            // Connection attempt timed out under a general timeout — treat as ConnectionError
+            // Connection attempt timed out under a general/single timeout
             return raise_exception(py, "ConnectionError", msg);
         }
-        // Read / general timeout — ensure message contains "timed out"
-        if msg.to_lowercase().contains("timed out") {
-            return raise_exception(py, "ReadTimeout", msg);
-        }
-        return raise_exception(py, "ReadTimeout", format!("Read timed out. {}", msg));
+        // Read / general timeout
+        let read_msg = if msg.to_lowercase().contains("timed out") {
+            format!("Read timed out. (read timeout={})", msg)
+        } else {
+            format!("Read timed out. {}", msg)
+        };
+        return raise_nested_exception(py, "ReadTimeout", read_msg);
     }
 
-    if e.is_connect() {
-        return raise_exception(py, "ConnectionError", msg);
+    // 4. Body/decode errors
+    if e.is_decode() {
+        return raise_exception(py, "ContentDecodingError", msg);
     }
 
+    // 5. Redirect errors
     if e.is_redirect() {
         return raise_exception(py, "TooManyRedirects", msg);
     }
 
+    // 6. Builder errors
+    if e.is_builder() {
+        return raise_exception(py, "InvalidURL", msg);
+    }
+
+    // 7. Connection closed / chunked encoding
+    let lower = msg.to_lowercase();
+    if lower.contains("connection closed") || lower.contains("incompletemessage") {
+        return raise_exception(py, "ChunkedEncodingError", msg);
+    }
+
+    // Default
     raise_exception(py, "ConnectionError", msg)
 }
 
@@ -265,6 +309,7 @@ impl ClientConfig {
     fn from_params(params: &RequestParams) -> Self {
         let connect_timeout_ms = match &params.timeout {
             Some(TimeoutParameter::Pair(Some(c), _)) => Some((*c * 1000.0) as u64),
+            Some(TimeoutParameter::Single(s)) => Some((*s * 1000.0) as u64),
             _ => None,
         };
         Self {
@@ -398,9 +443,25 @@ impl Session {
             };
         }
 
+        // Set per-request timeout for the overall request duration.
+        // Note: connect_timeout is set on the client builder in create_client_for_config.
+        // For Single timeouts, we add a small margin (50ms) so that connect_timeout
+        // fires first for connect-phase failures (avoiding a race condition in reqwest
+        // where request.timeout fires before connect_timeout).
         if let Some(timeout_params) = &params.timeout {
-            if let Some(timeout_duration) = self.calculate_timeout(timeout_params) {
-                request = request.timeout(timeout_duration);
+            match timeout_params {
+                TimeoutParameter::Single(secs) => {
+                    // Add 50ms margin so connect_timeout fires first
+                    request = request.timeout(std::time::Duration::from_secs_f64(*secs + 0.05));
+                }
+                TimeoutParameter::Pair(connect, Some(read)) => {
+                    // Overall timeout = connect + read so connect_timeout fires first
+                    let connect_secs = connect.unwrap_or(0.0);
+                    request = request.timeout(std::time::Duration::from_secs_f64(
+                        connect_secs + *read,
+                    ));
+                }
+                TimeoutParameter::Pair(_, None) => {} // No read timeout
             }
         }
 
@@ -423,21 +484,6 @@ impl Session {
                 ))
             })
         })
-    }
-
-    /// Returns the read/overall timeout duration for the request builder.
-    /// Connect timeout is handled separately on the client builder.
-    fn calculate_timeout(
-        &self,
-        timeout_params: &TimeoutParameter,
-    ) -> Option<std::time::Duration> {
-        match timeout_params {
-            TimeoutParameter::Single(secs) => Some(std::time::Duration::from_secs_f64(*secs)),
-            TimeoutParameter::Pair(_, Some(read)) => {
-                Some(std::time::Duration::from_secs_f64(*read))
-            }
-            TimeoutParameter::Pair(_, None) => None, // No read timeout
-        }
     }
 
     fn update_session_cookies(
@@ -556,11 +602,7 @@ impl Session {
         // Release the GIL so Python-based servers (httpbin etc.) can process
         Python::attach(|py| {
             py.detach(|| {
-                request.send().map_err(|e| {
-                    // We need the GIL back to create the Python exception
-                    // The error will be converted when we re-acquire the GIL
-                    e
-                })
+                request.send().map_err(|e| e)
             })
             .map_err(|e| map_reqwest_error(py, e, had_explicit_connect_timeout))
         })
@@ -574,6 +616,7 @@ impl Session {
             &params.timeout,
             Some(TimeoutParameter::Pair(Some(_), _))
         );
+
 
         let original_method = params.method.clone();
         let request_url = params.url.clone();
