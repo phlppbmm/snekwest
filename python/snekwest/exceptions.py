@@ -1,5 +1,9 @@
-"""Exception classes for snekwest."""
+"""Exception classes for snekwest.
 
+Re-exported from the native Rust extension module.
+"""
+
+# pylint: disable=no-name-in-module,redefined-builtin
 from snekwest._bindings import (
     ChunkedEncodingError,
     ConnectionError,

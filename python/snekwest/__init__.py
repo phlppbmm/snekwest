@@ -1,7 +1,9 @@
+"""snekwest — a Rust-backed, requests-compatible HTTP client for Python."""
+
 from snekwest.api import delete, get, head, options, patch, post, put, request
 from snekwest.models import Response
 from snekwest.sessions import Session
-from snekwest.exceptions import (
+from snekwest.exceptions import (  # pylint: disable=redefined-builtin  # requests-compatible API
     ConnectionError,
     ConnectTimeout,
     FileModeWarning,

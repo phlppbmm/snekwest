@@ -1,7 +1,10 @@
-from typing import Any, Optional, Union
+"""Session management for snekwest, providing persistent connections and cookies."""
 
-from snekwest._bindings import Response as RustResponse
-from snekwest._bindings import Session as RustSession
+from typing import Any, Optional, Union
+from urllib.parse import urlencode
+
+from snekwest._bindings import Response as RustResponse  # pylint: disable=no-name-in-module
+from snekwest._bindings import Session as RustSession  # pylint: disable=no-name-in-module
 
 from .models import Response
 
@@ -39,19 +42,24 @@ class _CookieProxy:
         return repr(self._rust_session.get_cookies())
 
     def get(self, key: str, default=None):
+        """Return the cookie value for key, or default."""
         cookies = self._rust_session.get_cookies()
         return cookies.get(key, default)
 
     def items(self):
+        """Return cookie (name, value) pairs."""
         return self._rust_session.get_cookies().items()
 
     def keys(self):
+        """Return cookie names."""
         return self._rust_session.get_cookies().keys()
 
     def values(self):
+        """Return cookie values."""
         return self._rust_session.get_cookies().values()
 
     def update(self, other=None, **kwargs):
+        """Update cookies from a mapping or keyword arguments."""
         if other:
             self._rust_session.set_cookies(dict(other))
         if kwargs:
@@ -59,6 +67,8 @@ class _CookieProxy:
 
 
 class Session:
+    """A requests-compatible HTTP session with persistent cookies and defaults."""
+
     def __init__(self) -> None:
         self._rust_session = RustSession()
         self.cookies = _CookieProxy(self._rust_session)
@@ -74,6 +84,7 @@ class Session:
         self.close()
 
     def close(self) -> None:
+        """Close the session and release resources."""
         self._rust_session.close()
 
     def _sync_session_defaults(self) -> None:
@@ -83,7 +94,7 @@ class Session:
         self._rust_session.default_params = self.params if self.params else None
         self._rust_session.max_redirects = self.max_redirects
 
-    def request(
+    def request(  # pylint: disable=too-many-arguments,too-many-locals  # requests-compatible API
         self,
         method: str,
         url: str,
@@ -103,6 +114,7 @@ class Session:
         cert: Optional[Union[str, tuple[str, str]]] = None,
         json: Optional[Any] = None,
     ) -> Response:
+        """Send an HTTP request with the given method and URL."""
         _ = hooks
 
         # Handle bytes method (e.g. b"GET")
@@ -113,7 +125,6 @@ class Session:
         # e.g. {"test": ["foo", "baz"]} -> {"test": "foo", "test": "baz"}
         # Since HashMap can't hold duplicates, we encode them into the URL
         if params is not None and isinstance(params, dict):
-            from urllib.parse import urlencode
             has_list = any(isinstance(v, (list, tuple)) for v in params.values())
             if has_list:
                 # Build query string with repeated keys
@@ -155,25 +166,32 @@ class Session:
         return Response(rust_response)
 
     def get(self, url: str, **kwargs) -> Response:
+        """Send a GET request."""
         kwargs.setdefault("allow_redirects", True)
         return self.request("GET", url, **kwargs)
 
     def options(self, url: str, **kwargs) -> Response:
+        """Send an OPTIONS request."""
         kwargs.setdefault("allow_redirects", True)
         return self.request("OPTIONS", url, **kwargs)
 
     def head(self, url: str, **kwargs) -> Response:
+        """Send a HEAD request."""
         kwargs.setdefault("allow_redirects", False)
         return self.request("HEAD", url, **kwargs)
 
     def post(self, url: str, data=None, json=None, **kwargs) -> Response:
+        """Send a POST request."""
         return self.request("POST", url, data=data, json=json, **kwargs)
 
     def put(self, url: str, data=None, **kwargs) -> Response:
+        """Send a PUT request."""
         return self.request("PUT", url, data=data, **kwargs)
 
     def patch(self, url: str, data=None, **kwargs) -> Response:
+        """Send a PATCH request."""
         return self.request("PATCH", url, data=data, **kwargs)
 
     def delete(self, url: str, **kwargs) -> Response:
+        """Send a DELETE request."""
         return self.request("DELETE", url, **kwargs)
