@@ -6,7 +6,8 @@ pyo3::create_exception!(exceptions, RequestException, PyException);
 // Direct children of RequestException
 pyo3::create_exception!(exceptions, HTTPError, RequestException);
 pyo3::create_exception!(exceptions, ConnectionError, RequestException);
-pyo3::create_exception!(exceptions, Timeout, RequestException);
+// Timeout inherits from ConnectionError (matching python-requests hierarchy)
+pyo3::create_exception!(exceptions, Timeout, ConnectionError);
 pyo3::create_exception!(exceptions, URLRequired, RequestException);
 pyo3::create_exception!(exceptions, TooManyRedirects, RequestException);
 pyo3::create_exception!(exceptions, MissingSchema, RequestException);

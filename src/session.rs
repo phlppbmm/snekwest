@@ -86,6 +86,16 @@ fn validate_url(url: &str) -> PyResult<()> {
 
             // Check for invalid characters in hostname
             let host = after_slashes.split('/').next().unwrap_or("");
+
+            // Detect bare IPv6 addresses (without brackets)
+            // e.g. http://fe80::5054:ff:fe5a:fc0 is invalid, should be http://[fe80::...]/
+            if !host.starts_with('[') && host.chars().filter(|c| *c == ':').count() > 1 {
+                return Err(PyErr::new::<exceptions::InvalidURL, _>(format!(
+                    "Invalid URL {:?}: Invalid IPv6 URL",
+                    url
+                )));
+            }
+
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port.starts_with('*') || host_no_port.starts_with('.') {
                 return Err(PyErr::new::<exceptions::InvalidURL, _>(format!(
@@ -118,53 +128,67 @@ fn repr_str(s: &str) -> String {
     format!("'{}'", s)
 }
 
+fn is_ssl_error_text(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("certificate")
+        || lower.contains("ssl")
+        || lower.contains("tls")
+        || lower.contains("handshake")
+        || lower.contains("unknown issuer")
+        || lower.contains("self signed")
+}
+
+/// Collect the full error chain (including nested source errors) into a single string.
+fn full_error_chain(e: &reqwest::Error) -> String {
+    use std::error::Error;
+    let mut msg = e.to_string();
+    let mut source: Option<&dyn Error> = e.source();
+    while let Some(s) = source {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        source = s.source();
+    }
+    msg
+}
+
 /// Map a reqwest error to the appropriate Python exception.
-fn map_reqwest_error(e: reqwest::Error) -> PyErr {
-    let msg = e.to_string();
+/// `had_explicit_connect_timeout` is true when the user passed a (connect, read) timeout tuple
+/// with a non-None connect value, signaling that ConnectTimeout should be raised.
+fn map_reqwest_error(e: reqwest::Error, had_explicit_connect_timeout: bool) -> PyErr {
+    let msg = full_error_chain(&e);
+
+    // Check for SSL/TLS errors first — they may appear as connect errors
+    if is_ssl_error_text(&msg) {
+        return PyErr::new::<exceptions::SSLError, _>(msg);
+    }
 
     if e.is_timeout() {
         if e.is_connect() {
-            return PyErr::new::<exceptions::ConnectTimeout, _>(msg);
+            if had_explicit_connect_timeout {
+                // User explicitly set a connect timeout via (connect, read) tuple
+                return PyErr::new::<exceptions::ConnectTimeout, _>(
+                    format!("ConnectTimeout: connection timed out. {}", msg),
+                );
+            }
+            // Connection attempt timed out under a general timeout — treat as ConnectionError
+            return PyErr::new::<exceptions::ConnectionError, _>(msg);
         }
-        // Check if it's a read timeout based on message
-        if msg.contains("read") || msg.contains("operation timed out") {
+        // Read / general timeout — ensure message contains "timed out"
+        if msg.to_lowercase().contains("timed out") {
             return PyErr::new::<exceptions::ReadTimeout, _>(msg);
         }
-        return PyErr::new::<exceptions::ReadTimeout, _>(msg);
+        return PyErr::new::<exceptions::ReadTimeout, _>(format!(
+            "Read timed out. {}",
+            msg
+        ));
     }
 
     if e.is_connect() {
-        // Check for SSL/TLS errors
-        if msg.contains("certificate")
-            || msg.contains("SSL")
-            || msg.contains("TLS")
-            || msg.contains("tls")
-            || msg.contains("ssl")
-            || msg.contains("CertificateRequired")
-            || msg.contains("InvalidCertificate")
-        {
-            return PyErr::new::<exceptions::SSLError, _>(msg);
-        }
         return PyErr::new::<exceptions::ConnectionError, _>(msg);
     }
 
     if e.is_redirect() {
         return PyErr::new::<exceptions::TooManyRedirects, _>(msg);
-    }
-
-    // General connection errors
-    if msg.contains("certificate")
-        || msg.contains("SSL")
-        || msg.contains("TLS")
-        || msg.contains("tls")
-        || msg.contains("ssl")
-        || msg.contains("InvalidCertificate")
-    {
-        return PyErr::new::<exceptions::SSLError, _>(msg);
-    }
-
-    if msg.contains("dns") || msg.contains("resolve") || msg.contains("No such host") {
-        return PyErr::new::<exceptions::ConnectionError, _>(msg);
     }
 
     PyErr::new::<exceptions::ConnectionError, _>(msg)
@@ -175,14 +199,20 @@ struct ClientConfig {
     verify: bool,
     cert_hash: Option<String>,
     proxy_hash: Option<String>,
+    connect_timeout_ms: Option<u64>,
 }
 
 impl ClientConfig {
     fn from_params(params: &RequestParams) -> Self {
+        let connect_timeout_ms = match &params.timeout {
+            Some(TimeoutParameter::Pair(Some(c), _)) => Some((*c * 1000.0) as u64),
+            _ => None,
+        };
         Self {
             verify: params.verify.unwrap_or(true),
             cert_hash: params.cert.as_ref().map(|c| format!("{:?}", c)),
             proxy_hash: params.proxies.as_ref().map(|p| format!("{:?}", p)),
+            connect_timeout_ms,
         }
     }
 }
@@ -310,8 +340,9 @@ impl Session {
         }
 
         if let Some(timeout_params) = &params.timeout {
-            let timeout_duration = self.calculate_timeout(timeout_params);
-            request = request.timeout(timeout_duration);
+            if let Some(timeout_duration) = self.calculate_timeout(timeout_params) {
+                request = request.timeout(timeout_duration);
+            }
         }
 
         Ok(request)
@@ -335,18 +366,18 @@ impl Session {
         })
     }
 
-    fn calculate_timeout(&self, timeout_params: &TimeoutParameter) -> std::time::Duration {
+    /// Returns the read/overall timeout duration for the request builder.
+    /// Connect timeout is handled separately on the client builder.
+    fn calculate_timeout(
+        &self,
+        timeout_params: &TimeoutParameter,
+    ) -> Option<std::time::Duration> {
         match timeout_params {
-            TimeoutParameter::Single(secs) => std::time::Duration::from_secs_f64(*secs),
-            TimeoutParameter::Pair(connect_timeout, read_timeout) => {
-                // Use the smaller non-None timeout, or the available one
-                match (connect_timeout, read_timeout) {
-                    (Some(c), Some(r)) => std::time::Duration::from_secs_f64(c.max(*r)),
-                    (Some(c), None) => std::time::Duration::from_secs_f64(*c),
-                    (None, Some(r)) => std::time::Duration::from_secs_f64(*r),
-                    (None, None) => std::time::Duration::from_secs(300), // 5 min default
-                }
+            TimeoutParameter::Single(secs) => Some(std::time::Duration::from_secs_f64(*secs)),
+            TimeoutParameter::Pair(_, Some(read)) => {
+                Some(std::time::Duration::from_secs_f64(*read))
             }
+            TimeoutParameter::Pair(_, None) => None, // No read timeout
         }
     }
 
@@ -434,6 +465,10 @@ impl Session {
         // Always disable automatic redirects - we handle them manually
         builder = builder.redirect(reqwest::redirect::Policy::none());
 
+        if let Some(ct_ms) = config.connect_timeout_ms {
+            builder = builder.connect_timeout(std::time::Duration::from_millis(ct_ms));
+        }
+
         let client = builder
             .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
@@ -453,6 +488,7 @@ impl Session {
         cookies: &HashMap<String, String>,
         auth: &Option<(String, String)>,
         extra_headers: &Option<HashMap<String, String>>,
+        had_explicit_connect_timeout: bool,
     ) -> PyResult<reqwest::blocking::Response> {
         let request =
             self.build_request(client, method, url, params, cookies, auth, extra_headers)?;
@@ -460,13 +496,22 @@ impl Session {
 
         // Release the GIL so Python-based servers (httpbin etc.) can process
         Python::attach(|py| {
-            py.detach(|| request.send().map_err(map_reqwest_error))
+            py.detach(|| {
+                request
+                    .send()
+                    .map_err(|e| map_reqwest_error(e, had_explicit_connect_timeout))
+            })
         })
     }
 
-    fn do_request(&self, params: RequestParams) -> PyResult<Response> {
+    fn do_request(&self, mut params: RequestParams) -> PyResult<Response> {
         let client = self.get_or_create_client(&params)?;
         let start = Instant::now();
+
+        let had_explicit_connect_timeout = matches!(
+            &params.timeout,
+            Some(TimeoutParameter::Pair(Some(_), _))
+        );
 
         let original_method = params.method.clone();
         let request_url = params.url.clone();
@@ -514,6 +559,10 @@ impl Session {
                     base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p));
                 req_headers.insert("Authorization".to_string(), format!("Basic {}", encoded));
             }
+            // Track Content-Type for json requests
+            if params.json.is_some() {
+                req_headers.insert("Content-Type".to_string(), "application/json".to_string());
+            }
 
             // Track request headers for each hop
             final_request_headers = req_headers.clone();
@@ -526,6 +575,7 @@ impl Session {
                 &current_cookies,
                 &current_auth,
                 &extra_headers,
+                had_explicit_connect_timeout,
             )?;
 
             let status = response.status().as_u16();
@@ -611,8 +661,14 @@ impl Session {
                     if matches!(status, 301 | 302 | 303) && current_method.to_uppercase() != "HEAD"
                     {
                         current_method = "GET".to_string();
+                        // Clear body for redirected GET
+                        params.data = None;
+                        params.json = None;
                     }
                     // 307, 308: method stays the same
+
+                    // Don't re-apply query params on redirect URLs
+                    params.params = None;
                 } else {
                     // No location header, stop redirecting
                     break;

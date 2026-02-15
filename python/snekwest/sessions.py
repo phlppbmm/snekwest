@@ -109,9 +109,26 @@ class Session:
         if isinstance(method, bytes):
             method = method.decode("utf-8")
 
-        # Coerce params values to strings (requests does this automatically)
-        if params is not None:
-            if isinstance(params, dict):
+        # Expand list/tuple params values into repeated keys
+        # e.g. {"test": ["foo", "baz"]} -> {"test": "foo", "test": "baz"}
+        # Since HashMap can't hold duplicates, we encode them into the URL
+        if params is not None and isinstance(params, dict):
+            from urllib.parse import urlencode
+            has_list = any(isinstance(v, (list, tuple)) for v in params.values())
+            if has_list:
+                # Build query string with repeated keys
+                parts = []
+                for k, v in params.items():
+                    if isinstance(v, (list, tuple)):
+                        for item in v:
+                            parts.append((str(k), str(item)))
+                    else:
+                        parts.append((str(k), str(v)))
+                # Append to URL directly
+                separator = "&" if "?" in url else "?"
+                url = url + separator + urlencode(parts)
+                params = None
+            else:
                 params = {str(k): str(v) for k, v in params.items()}
 
         # Sync session-level defaults to Rust
