@@ -46,6 +46,54 @@ fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
+/// Decide whether the Authorization header should be stripped when redirecting
+/// from `old_url` to `new_url`. Mirrors requests' `should_strip_auth`.
+fn should_strip_auth(old_url: &str, new_url: &str) -> bool {
+    let old = match url::Url::parse(old_url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    let new = match url::Url::parse(new_url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+
+    // Different host → always strip
+    if old.host_str() != new.host_str() {
+        return true;
+    }
+
+    // HTTP → HTTPS on default ports → safe upgrade, don't strip
+    let old_port = old.port_or_known_default();
+    let new_port = new.port_or_known_default();
+    if old.scheme() == "http"
+        && new.scheme() == "https"
+        && old_port == Some(80)
+        && new_port == Some(443)
+    {
+        return false;
+    }
+
+    let changed_scheme = old.scheme() != new.scheme();
+    let changed_port = old_port != new_port;
+
+    // Same scheme, both on default ports → don't strip
+    if !changed_scheme {
+        let default_port = match old.scheme() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        };
+        let old_is_default = old.port().is_none() || old.port() == default_port;
+        let new_is_default = new.port().is_none() || new.port() == default_port;
+        if old_is_default && new_is_default {
+            return false;
+        }
+    }
+
+    changed_port || changed_scheme
+}
+
 /// Validate the URL and raise the appropriate Python exception for invalid URLs.
 fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
     // Empty or whitespace-only
@@ -546,7 +594,7 @@ impl Session {
         let mut current_url = request_url.clone();
         let mut history: Vec<Response> = Vec::new();
         let mut current_cookies = merged_cookies;
-        let current_auth = auth.clone();
+        let mut current_auth = auth.clone();
         let max_redirects = if params.allow_redirects {
             self.max_redirects
         } else {
@@ -623,12 +671,51 @@ impl Session {
                     });
                 }
 
-                // Get redirect location
-                let location = response
+                // Get redirect location — if missing, treat as final response
+                let location = match response
                     .headers()
                     .get("location")
                     .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+                    .map(|s| s.to_string())
+                {
+                    Some(loc) => loc,
+                    None => {
+                        // No Location header — return this as the final response
+                        let resp_headers = Self::extract_response_headers(&response);
+                        let resp_cookies = Self::extract_response_cookies(&response);
+                        let reason = reason_phrase(status);
+                        let resp_url = response.url().to_string();
+                        let body = response
+                            .bytes()
+                            .map_err(|e| {
+                                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                            })?
+                            .to_vec();
+                        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        final_request_headers = req_headers;
+                        let mut final_url = resp_url;
+                        if let Some(frag_pos) = request_url.find('#') {
+                            let fragment = &request_url[frag_pos..];
+                            if !final_url.contains('#') {
+                                final_url.push_str(fragment);
+                            }
+                        }
+                        return Ok(Response::new(
+                            status,
+                            final_url,
+                            resp_headers,
+                            body,
+                            elapsed_ms,
+                            history,
+                            resp_cookies,
+                            reason,
+                            is_redir,
+                            current_method,
+                            request_url,
+                            final_request_headers,
+                        ));
+                    }
+                };
 
                 let resp_headers = Self::extract_response_headers(&response);
                 let resp_cookies = Self::extract_response_cookies(&response);
@@ -655,40 +742,62 @@ impl Session {
                 );
                 history.push(intermediate);
 
-                if let Some(loc) = location {
-                    // Resolve redirect URL against current URL
-                    current_url = if let Ok(base) = url::Url::parse(&current_url) {
-                        // Use url::Url::join which handles absolute, relative,
-                        // and path-only URLs correctly (preserving port, etc.)
-                        base.join(&loc).map(|u| u.to_string()).unwrap_or(loc)
-                    } else {
-                        loc
-                    };
+                let previous_url = current_url.clone();
 
-                    // Maintain fragment from original URL
-                    if let Some(frag_pos) = request_url.find('#') {
-                        let fragment = &request_url[frag_pos..];
-                        if !current_url.contains('#') {
-                            current_url.push_str(fragment);
-                        }
-                    }
-
-                    // 301, 302, 303: POST -> GET (but HEAD stays HEAD)
-                    if matches!(status, 301 | 302 | 303) && current_method.to_uppercase() != "HEAD"
-                    {
-                        current_method = "GET".to_string();
-                        // Clear body for redirected GET
-                        params.data = None;
-                        params.json = None;
-                    }
-                    // 307, 308: method stays the same
-
-                    // Don't re-apply query params on redirect URLs
-                    params.params = None;
+                // Resolve redirect URL against current URL
+                current_url = if let Ok(base) = url::Url::parse(&current_url) {
+                    base.join(&location).map(|u| u.to_string()).unwrap_or(location)
                 } else {
-                    // No location header, stop redirecting
-                    break;
+                    location
+                };
+
+                // Maintain fragment from original URL
+                if let Some(frag_pos) = request_url.find('#') {
+                    let fragment = &request_url[frag_pos..];
+                    if !current_url.contains('#') {
+                        current_url.push_str(fragment);
+                    }
                 }
+
+                // Strip auth when redirecting to a different host/scheme
+                if should_strip_auth(&previous_url, &current_url) {
+                    current_auth = None;
+                    params.headers.as_mut().map(|h| h.remove("Authorization"));
+                }
+
+                // 301: only POST -> GET (other methods preserved)
+                // 302, 303: all non-HEAD -> GET
+                let method_changed;
+                if status == 301 && current_method.to_uppercase() == "POST" {
+                    current_method = "GET".to_string();
+                    method_changed = true;
+                } else if matches!(status, 302 | 303)
+                    && current_method.to_uppercase() != "HEAD"
+                {
+                    current_method = "GET".to_string();
+                    method_changed = true;
+                } else {
+                    method_changed = false;
+                }
+                // 307, 308: method stays the same
+
+                // Strip body and content headers when method changed to GET
+                if method_changed {
+                    params.data = None;
+                    params.json = None;
+                    params.files = None;
+                    if let Some(ref mut h) = params.headers {
+                        h.remove("Content-Length");
+                        h.remove("content-length");
+                        h.remove("Content-Type");
+                        h.remove("content-type");
+                        h.remove("Transfer-Encoding");
+                        h.remove("transfer-encoding");
+                    }
+                }
+
+                // Don't re-apply query params on redirect URLs
+                params.params = None;
                 continue;
             }
 
