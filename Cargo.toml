@@ -15,6 +15,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "rustls-tls",
     "multipart",
+    "gzip",
+    "deflate",
+    "brotli",
 ] }
 serde_json = "1"
 base64 = "0.22"

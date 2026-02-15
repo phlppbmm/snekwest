@@ -590,25 +590,13 @@ impl Session {
                 history.push(intermediate);
 
                 if let Some(loc) = location {
-                    // Resolve relative URLs
-                    current_url = if loc.starts_with("http://") || loc.starts_with("https://") {
-                        loc
-                    } else if loc.starts_with("HTTP://") || loc.starts_with("HTTPS://") {
-                        loc
-                    } else if loc.starts_with('/') {
-                        // Absolute path - combine with current URL's scheme+host
-                        if let Ok(base) = url::Url::parse(&current_url) {
-                            format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), loc)
-                        } else {
-                            loc
-                        }
+                    // Resolve redirect URL against current URL
+                    current_url = if let Ok(base) = url::Url::parse(&current_url) {
+                        // Use url::Url::join which handles absolute, relative,
+                        // and path-only URLs correctly (preserving port, etc.)
+                        base.join(&loc).map(|u| u.to_string()).unwrap_or(loc)
                     } else {
-                        // Relative path
-                        if let Ok(base) = url::Url::parse(&current_url) {
-                            base.join(&loc).map(|u| u.to_string()).unwrap_or(loc)
-                        } else {
-                            loc
-                        }
+                        loc
                     };
 
                     // Maintain fragment from original URL

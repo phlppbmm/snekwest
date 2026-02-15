@@ -67,12 +67,14 @@ class Response:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            raise HTTPError(
+            msg = (
                 f"{self.status_code} Client Error: {self.reason} for url: {self.url}"
                 if self.status_code < 500
-                else f"{self.status_code} Server Error: {self.reason} for url: {self.url}",
-                response=self,
+                else f"{self.status_code} Server Error: {self.reason} for url: {self.url}"
             )
+            error = HTTPError(msg)
+            error.response = self  # type: ignore[attr-defined]
+            raise error
 
     def close(self) -> None:
         pass

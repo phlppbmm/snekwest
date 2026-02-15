@@ -109,6 +109,11 @@ class Session:
         if isinstance(method, bytes):
             method = method.decode("utf-8")
 
+        # Coerce params values to strings (requests does this automatically)
+        if params is not None:
+            if isinstance(params, dict):
+                params = {str(k): str(v) for k, v in params.items()}
+
         # Sync session-level defaults to Rust
         self._sync_session_defaults()
 
