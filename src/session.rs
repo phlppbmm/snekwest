@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::exceptions;
+use crate::exceptions::raise_exception;
 use crate::request_params::CertParameter;
 use crate::request_params::{DataParameter, RequestParams, TimeoutParameter};
 use crate::response::Response;
@@ -47,11 +47,13 @@ fn is_redirect_status(status: u16) -> bool {
 }
 
 /// Validate the URL and raise the appropriate Python exception for invalid URLs.
-fn validate_url(url: &str) -> PyResult<()> {
+fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
     // Empty or whitespace-only
     let trimmed = url.trim();
     if trimmed.is_empty() {
-        return Err(PyErr::new::<exceptions::InvalidURL, _>(
+        return Err(raise_exception(
+            py,
+            "InvalidURL",
             format!("Invalid URL {}: No host supplied", repr_str(url)),
         ));
     }
@@ -68,10 +70,11 @@ fn validate_url(url: &str) -> PyResult<()> {
         if is_valid_scheme {
             let lower_scheme = scheme.to_lowercase();
             if lower_scheme != "http" && lower_scheme != "https" {
-                return Err(PyErr::new::<exceptions::InvalidSchema, _>(format!(
-                    "No connection adapters were found for {:?}",
-                    url
-                )));
+                return Err(raise_exception(
+                    py,
+                    "InvalidSchema",
+                    format!("No connection adapters were found for {:?}", url),
+                ));
             }
 
             // Has http/https scheme - check for valid host
@@ -79,7 +82,9 @@ fn validate_url(url: &str) -> PyResult<()> {
             let after_slashes = after_scheme.trim_start_matches('/');
 
             if after_slashes.is_empty() {
-                return Err(PyErr::new::<exceptions::InvalidURL, _>(
+                return Err(raise_exception(
+                    py,
+                    "InvalidURL",
                     format!("Invalid URL {:?}: No host supplied", url),
                 ));
             }
@@ -90,18 +95,20 @@ fn validate_url(url: &str) -> PyResult<()> {
             // Detect bare IPv6 addresses (without brackets)
             // e.g. http://fe80::5054:ff:fe5a:fc0 is invalid, should be http://[fe80::...]/
             if !host.starts_with('[') && host.chars().filter(|c| *c == ':').count() > 1 {
-                return Err(PyErr::new::<exceptions::InvalidURL, _>(format!(
-                    "Invalid URL {:?}: Invalid IPv6 URL",
-                    url
-                )));
+                return Err(raise_exception(
+                    py,
+                    "InvalidURL",
+                    format!("Invalid URL {:?}: Invalid IPv6 URL", url),
+                ));
             }
 
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port.starts_with('*') || host_no_port.starts_with('.') {
-                return Err(PyErr::new::<exceptions::InvalidURL, _>(format!(
-                    "Invalid URL {:?}: Invalid host",
-                    url
-                )));
+                return Err(raise_exception(
+                    py,
+                    "InvalidURL",
+                    format!("Invalid URL {:?}: Invalid host", url),
+                ));
             }
 
             return Ok(());
@@ -112,16 +119,21 @@ fn validate_url(url: &str) -> PyResult<()> {
     // or just a bare word (MissingSchema)
     if trimmed.contains(':') || trimmed.contains('/') {
         // Looks like host:port or host/path without a scheme
-        return Err(PyErr::new::<exceptions::InvalidSchema, _>(format!(
-            "No connection adapters were found for {:?}",
-            url
-        )));
+        return Err(raise_exception(
+            py,
+            "InvalidSchema",
+            format!("No connection adapters were found for {:?}", url),
+        ));
     }
 
-    Err(PyErr::new::<exceptions::MissingSchema, _>(format!(
-        "Invalid URL {:?}: No scheme supplied. Perhaps you meant \"https://{}\"?",
-        url, url
-    )))
+    Err(raise_exception(
+        py,
+        "MissingSchema",
+        format!(
+            "Invalid URL {:?}: No scheme supplied. Perhaps you meant \"https://{}\"?",
+            url, url
+        ),
+    ))
 }
 
 fn repr_str(s: &str) -> String {
@@ -154,44 +166,43 @@ fn full_error_chain(e: &reqwest::Error) -> String {
 /// Map a reqwest error to the appropriate Python exception.
 /// `had_explicit_connect_timeout` is true when the user passed a (connect, read) timeout tuple
 /// with a non-None connect value, signaling that ConnectTimeout should be raised.
-fn map_reqwest_error(e: reqwest::Error, had_explicit_connect_timeout: bool) -> PyErr {
+fn map_reqwest_error(py: Python<'_>, e: reqwest::Error, had_explicit_connect_timeout: bool) -> PyErr {
     let msg = full_error_chain(&e);
 
     // Check for SSL/TLS errors first — they may appear as connect errors
     if is_ssl_error_text(&msg) {
-        return PyErr::new::<exceptions::SSLError, _>(msg);
+        return raise_exception(py, "SSLError", msg);
     }
 
     if e.is_timeout() {
         if e.is_connect() {
             if had_explicit_connect_timeout {
                 // User explicitly set a connect timeout via (connect, read) tuple
-                return PyErr::new::<exceptions::ConnectTimeout, _>(
+                return raise_exception(
+                    py,
+                    "ConnectTimeout",
                     format!("ConnectTimeout: connection timed out. {}", msg),
                 );
             }
             // Connection attempt timed out under a general timeout — treat as ConnectionError
-            return PyErr::new::<exceptions::ConnectionError, _>(msg);
+            return raise_exception(py, "ConnectionError", msg);
         }
         // Read / general timeout — ensure message contains "timed out"
         if msg.to_lowercase().contains("timed out") {
-            return PyErr::new::<exceptions::ReadTimeout, _>(msg);
+            return raise_exception(py, "ReadTimeout", msg);
         }
-        return PyErr::new::<exceptions::ReadTimeout, _>(format!(
-            "Read timed out. {}",
-            msg
-        ));
+        return raise_exception(py, "ReadTimeout", format!("Read timed out. {}", msg));
     }
 
     if e.is_connect() {
-        return PyErr::new::<exceptions::ConnectionError, _>(msg);
+        return raise_exception(py, "ConnectionError", msg);
     }
 
     if e.is_redirect() {
-        return PyErr::new::<exceptions::TooManyRedirects, _>(msg);
+        return raise_exception(py, "TooManyRedirects", msg);
     }
 
-    PyErr::new::<exceptions::ConnectionError, _>(msg)
+    raise_exception(py, "ConnectionError", msg)
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -497,10 +508,13 @@ impl Session {
         // Release the GIL so Python-based servers (httpbin etc.) can process
         Python::attach(|py| {
             py.detach(|| {
-                request
-                    .send()
-                    .map_err(|e| map_reqwest_error(e, had_explicit_connect_timeout))
+                request.send().map_err(|e| {
+                    // We need the GIL back to create the Python exception
+                    // The error will be converted when we re-acquire the GIL
+                    e
+                })
             })
+            .map_err(|e| map_reqwest_error(py, e, had_explicit_connect_timeout))
         })
     }
 
@@ -600,11 +614,13 @@ impl Session {
 
             if is_redir && params.allow_redirects {
                 if history.len() >= max_redirects {
-                    // Build a partial response for the TooManyRedirects error
-                    return Err(PyErr::new::<exceptions::TooManyRedirects, _>(format!(
-                        "Exceeded {} redirects.",
-                        max_redirects
-                    )));
+                    return Python::attach(|py| {
+                        Err(raise_exception(
+                            py,
+                            "TooManyRedirects",
+                            format!("Exceeded {} redirects.", max_redirects),
+                        ))
+                    });
                 }
 
                 // Get redirect location
@@ -760,6 +776,7 @@ impl Session {
     ))]
     fn make_request(
         &self,
+        py: Python<'_>,
         method: String,
         url: String,
         params: Option<HashMap<String, String>>,
@@ -777,7 +794,7 @@ impl Session {
         cert: Option<CertParameter>,
     ) -> PyResult<Response> {
         // Validate URL first
-        validate_url(&url)?;
+        validate_url(py, &url)?;
 
         let params = RequestParams::from_args(
             method,
