@@ -242,18 +242,31 @@ fn repr_str(s: &str) -> String {
 }
 
 /// Check if the error originates from an SSL/TLS issue by walking the source chain.
-/// This avoids false positives from URLs containing "ssl" in the path.
+///
+/// Primary detection: `downcast_ref::<rustls::Error>()` on each source in the chain.
+/// Any `rustls::Error` variant (InvalidCertificate, AlertReceived, etc.) is a TLS error.
+///
+/// Fallback: string matching for cases where rustls errors are wrapped in types
+/// that lose the concrete error (e.g. some `std::io::Error` wrappers).
 fn is_ssl_error(e: &reqwest::Error) -> bool {
     use std::error::Error;
     // Skip the top-level reqwest error (which contains the URL) and check sources
     let mut source: Option<&dyn Error> = e.source();
     while let Some(s) = source {
+        // Type-based detection: any rustls::Error in the chain is definitively TLS
+        if s.downcast_ref::<rustls::Error>().is_some() {
+            return true;
+        }
+        // String-based fallback for wrapped errors that lose the concrete type
         let msg = s.to_string().to_lowercase();
         if msg.contains("certificate")
             || msg.contains("handshake")
             || msg.contains("unknown issuer")
             || msg.contains("self signed")
+            || msg.contains("self-signed")
             || msg.contains("alertreceived")
+            || msg.contains("expired")
+            || msg.contains("revoked")
         {
             return true;
         }
