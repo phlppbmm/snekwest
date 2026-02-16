@@ -1,0 +1,1048 @@
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{IntoPyDict, PyBytes, PyDict, PyList, PyString, PyTuple};
+
+use crate::case_insensitive_dict::CaseInsensitiveDict;
+
+#[pyclass]
+pub struct PreparedRequest {
+    #[pyo3(get, set)]
+    pub method: Option<String>,
+    #[pyo3(get, set)]
+    pub url: Option<String>,
+    // Headers: stored as Option<Py<CaseInsensitiveDict>>
+    headers_inner: Option<Py<CaseInsensitiveDict>>,
+    #[pyo3(get, set)]
+    pub body: Option<Py<PyAny>>,
+    hooks_inner: Py<PyAny>, // dict {"response": []}
+    cookies_inner: Option<Py<PyAny>>, // CookieJar or None
+    body_position_inner: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PreparedRequest {
+    #[new]
+    fn new(py: Python<'_>) -> PyResult<Self> {
+        let hooks = py
+            .import("snekwest.hooks")?
+            .call_method0("default_hooks")?
+            .unbind();
+        Ok(PreparedRequest {
+            method: None,
+            url: None,
+            headers_inner: None,
+            body: None,
+            hooks_inner: hooks,
+            cookies_inner: None,
+            body_position_inner: None,
+        })
+    }
+
+    // -- Properties with custom getters/setters --
+
+    #[getter]
+    fn headers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.headers_inner {
+            Some(h) => Ok(h.clone_ref(py).into_any()),
+            None => Ok(py.None().into()),
+        }
+    }
+
+    #[setter]
+    fn set_headers(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.headers_inner = None;
+        } else if let Ok(cid) = value.cast::<CaseInsensitiveDict>() {
+            self.headers_inner = Some(cid.clone().unbind());
+        } else {
+            // If it's a dict or other mapping, convert to CaseInsensitiveDict
+            let cid_type = py
+                .import("snekwest.structures")?
+                .getattr("CaseInsensitiveDict")?;
+            let cid = cid_type.call1((&value,))?;
+            self.headers_inner = Some(cid.cast::<CaseInsensitiveDict>()?.clone().unbind());
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn hooks(&self, py: Python<'_>) -> Py<PyAny> {
+        self.hooks_inner.clone_ref(py)
+    }
+
+    #[setter]
+    fn set_hooks(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        self.hooks_inner = value.unbind();
+        Ok(())
+    }
+
+    #[getter]
+    fn _cookies(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.cookies_inner {
+            Some(c) => Ok(c.clone_ref(py)),
+            None => Ok(py.None().into()),
+        }
+    }
+
+    #[setter]
+    #[allow(non_snake_case)]
+    fn set__cookies(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.cookies_inner = None;
+        } else {
+            self.cookies_inner = Some(value.unbind());
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn _body_position(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.body_position_inner {
+            Some(p) => Ok(p.clone_ref(py)),
+            None => Ok(py.None().into()),
+        }
+    }
+
+    #[setter]
+    #[allow(non_snake_case)]
+    fn set__body_position(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.body_position_inner = None;
+        } else {
+            self.body_position_inner = Some(value.unbind());
+        }
+        Ok(())
+    }
+
+    // -- Main prepare method --
+
+    #[pyo3(signature = (method=None, url=None, headers=None, files=None, data=None, params=None, auth=None, cookies=None, hooks=None, json=None))]
+    fn prepare(
+        &mut self,
+        py: Python<'_>,
+        method: Option<&Bound<'_, PyAny>>,
+        url: Option<&Bound<'_, PyAny>>,
+        headers: Option<&Bound<'_, PyAny>>,
+        files: Option<&Bound<'_, PyAny>>,
+        data: Option<&Bound<'_, PyAny>>,
+        params: Option<&Bound<'_, PyAny>>,
+        auth: Option<&Bound<'_, PyAny>>,
+        cookies: Option<&Bound<'_, PyAny>>,
+        hooks: Option<&Bound<'_, PyAny>>,
+        json: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.prepare_method(method)?;
+        self.prepare_url_impl(py, url, params)?;
+        self.prepare_headers_impl(py, headers)?;
+        self.prepare_cookies_impl(py, cookies)?;
+        self.prepare_body_impl(py, data, files, json)?;
+        self.prepare_auth_impl(py, auth)?;
+        self.prepare_hooks_impl(py, hooks)?;
+        Ok(())
+    }
+
+    // -- Individual prepare methods --
+
+    fn prepare_method(&mut self, method: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        match method {
+            Some(m) if !m.is_none() => {
+                // Handle both str and bytes
+                let s: String = if m.is_instance_of::<PyBytes>() {
+                    let bytes: Vec<u8> = m.extract()?;
+                    String::from_utf8(bytes)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?
+                } else {
+                    m.str()?.to_string()
+                };
+                self.method = Some(s.trim().to_uppercase());
+            }
+            _ => {
+                self.method = None;
+            }
+        }
+        Ok(())
+    }
+
+    #[pyo3(name = "prepare_url")]
+    fn prepare_url_py(
+        &mut self,
+        py: Python<'_>,
+        url: Option<&Bound<'_, PyAny>>,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.prepare_url_impl(py, url, params)
+    }
+
+    #[pyo3(name = "prepare_headers")]
+    fn prepare_headers_py(
+        &mut self,
+        py: Python<'_>,
+        headers: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.prepare_headers_impl(py, headers)
+    }
+
+    #[pyo3(name = "prepare_body")]
+    fn prepare_body_py(
+        &mut self,
+        py: Python<'_>,
+        data: Option<&Bound<'_, PyAny>>,
+        files: Option<&Bound<'_, PyAny>>,
+        json: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.prepare_body_impl(py, data, files, json)
+    }
+
+    fn prepare_content_length(&mut self, py: Python<'_>, body: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.prepare_content_length_impl(py, body)
+    }
+
+    #[pyo3(name = "prepare_auth", signature = (auth=None, _url=None))]
+    fn prepare_auth_py(
+        &mut self,
+        py: Python<'_>,
+        auth: Option<&Bound<'_, PyAny>>,
+        _url: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.prepare_auth_impl(py, auth)
+    }
+
+    #[pyo3(name = "prepare_cookies")]
+    fn prepare_cookies_py(
+        &mut self,
+        py: Python<'_>,
+        cookies: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.prepare_cookies_impl(py, cookies)
+    }
+
+    #[pyo3(name = "prepare_hooks")]
+    fn prepare_hooks_py(
+        &mut self,
+        py: Python<'_>,
+        hooks: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.prepare_hooks_impl(py, hooks)
+    }
+
+    // -- path_url property --
+
+    #[getter]
+    fn path_url(&self, py: Python<'_>) -> PyResult<String> {
+        let url = match &self.url {
+            Some(u) => u.clone(),
+            None => return Ok("/".to_string()),
+        };
+        let urlsplit = py.import("urllib.parse")?.getattr("urlsplit")?;
+        let parts = urlsplit.call1((&url,))?;
+        let path: String = parts.getattr("path")?.extract::<String>().unwrap_or_default();
+        let query: String = parts
+            .getattr("query")?
+            .extract::<String>()
+            .unwrap_or_default();
+
+        let path = if path.is_empty() {
+            "/".to_string()
+        } else {
+            path
+        };
+
+        if query.is_empty() {
+            Ok(path)
+        } else {
+            Ok(format!("{}?{}", path, query))
+        }
+    }
+
+    // -- Hook registration --
+
+    fn register_hook(
+        &self,
+        py: Python<'_>,
+        event: &str,
+        hook: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let hooks_dict = self.hooks_inner.bind(py);
+
+        // Try to get the event list; if KeyError, the event is unsupported
+        let event_hooks = match hooks_dict.get_item(event) {
+            Ok(list) => list,
+            Err(_) => {
+                return Err(PyValueError::new_err(format!(
+                    "Unsupported event specified, with event name \"{event}\""
+                )));
+            }
+        };
+
+        // Check if hook is callable
+        let callable_mod = py.import("collections.abc")?.getattr("Callable")?;
+        if hook.is_instance(&callable_mod)? {
+            event_hooks.call_method1("append", (hook,))?;
+        } else if hook.hasattr("__iter__")? {
+            let iter = hook.try_iter()?;
+            for h in iter {
+                let h = h?;
+                if h.is_instance(&callable_mod)? {
+                    event_hooks.call_method1("append", (&h,))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deregister_hook(
+        &self,
+        py: Python<'_>,
+        event: &str,
+        hook: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let hooks_dict = self.hooks_inner.bind(py);
+        match hooks_dict.get_item(event) {
+            Ok(list) => match list.call_method1("remove", (hook,)) {
+                Ok(_) => Ok(true),
+                Err(_) => Ok(false),
+            },
+            Err(_) => Ok(false),
+        }
+    }
+
+    // -- copy --
+
+    fn copy(&self, py: Python<'_>) -> PyResult<PreparedRequest> {
+        let hooks = py
+            .import("snekwest.hooks")?
+            .call_method0("default_hooks")?
+            .unbind();
+
+        let new_headers = match &self.headers_inner {
+            Some(h) => {
+                let copied = h.bind(py).call_method0("copy")?;
+                Some(copied.cast::<CaseInsensitiveDict>()?.clone().unbind())
+            }
+            None => None,
+        };
+
+        let new_cookies = match &self.cookies_inner {
+            Some(c) => {
+                let copy_fn = py
+                    .import("snekwest.cookies")?
+                    .getattr("_copy_cookie_jar")?;
+                Some(copy_fn.call1((c.bind(py),))?.unbind())
+            }
+            None => None,
+        };
+
+        Ok(PreparedRequest {
+            method: self.method.clone(),
+            url: self.url.clone(),
+            headers_inner: new_headers,
+            body: self.body.as_ref().map(|b| b.clone_ref(py)),
+            hooks_inner: hooks,
+            cookies_inner: new_cookies,
+            body_position_inner: self
+                .body_position_inner
+                .as_ref()
+                .map(|p| p.clone_ref(py)),
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.method {
+            Some(m) => format!("<PreparedRequest [{}]>", m),
+            None => "<PreparedRequest [None]>".to_string(),
+        }
+    }
+
+    // -- Static methods for encoding (delegate to Python) --
+
+    #[staticmethod]
+    fn _encode_params(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        encode_params(py, data)
+    }
+
+    #[staticmethod]
+    fn _encode_files(
+        py: Python<'_>,
+        files: &Bound<'_, PyAny>,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        encode_files(py, files, data)
+    }
+}
+
+// ============================================================================
+// Internal implementations
+// ============================================================================
+
+impl PreparedRequest {
+    /// Public accessor for headers from other Rust modules
+    pub fn get_headers(&self) -> Option<&Py<CaseInsensitiveDict>> {
+        self.headers_inner.as_ref()
+    }
+
+    fn prepare_url_impl(
+        &mut self,
+        py: Python<'_>,
+        url: Option<&Bound<'_, PyAny>>,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let url = match url {
+            Some(u) if !u.is_none() => u.clone(),
+            _ => {
+                let exc = py
+                    .import("snekwest.exceptions")?
+                    .getattr("MissingSchema")?;
+                return Err(PyErr::from_value(exc.call1((
+                    "Invalid URL 'None': No scheme supplied. Perhaps you meant https://None?",
+                ))?));
+            }
+        };
+
+        // Convert bytes to str
+        let url_str: String = if url.is_instance_of::<PyBytes>() {
+            url.extract::<Vec<u8>>().and_then(|bytes| {
+                String::from_utf8(bytes).map_err(|e| PyValueError::new_err(e.to_string()))
+            })?
+        } else {
+            url.str()?.to_string()
+        };
+
+        // Remove leading whitespace
+        let url_str = url_str.trim_start().to_string();
+
+        // Don't do any URL preparation for non-HTTP schemes
+        if url_str.contains(':') && !url_str.to_lowercase().starts_with("http") {
+            self.url = Some(url_str);
+            return Ok(());
+        }
+
+        // Parse URL using our _parse_url function (Python)
+        let models_mod = py.import("snekwest.models")?;
+        let parse_result = match models_mod.call_method1("_parse_url", (&url_str,)) {
+            Ok(r) => r,
+            Err(e) => {
+                let invalid_url = py.import("snekwest.exceptions")?.getattr("InvalidURL")?;
+                let args = e.value(py).getattr("args")?;
+                return Err(PyErr::from_value(invalid_url.call1((args,))?));
+            }
+        };
+
+        let scheme: Option<String> = parse_result.getattr("scheme")?.extract()?;
+        let auth: Option<String> = parse_result.getattr("auth")?.extract()?;
+        let host: Option<String> = parse_result.getattr("host")?.extract()?;
+        let port: Option<u16> = parse_result.getattr("port")?.extract().ok();
+        let path: Option<String> = parse_result.getattr("path")?.extract()?;
+        let query: Option<String> = parse_result.getattr("query")?.extract()?;
+        let fragment: Option<String> = parse_result.getattr("fragment")?.extract()?;
+
+        let scheme = match scheme {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                let missing_schema =
+                    py.import("snekwest.exceptions")?.getattr("MissingSchema")?;
+                return Err(PyErr::from_value(missing_schema.call1((format!(
+                    "Invalid URL {url_str:?}: No scheme supplied. Perhaps you meant https://{url_str}?"
+                ),))?));
+            }
+        };
+
+        let host = match host {
+            Some(h) if !h.is_empty() => h,
+            _ => {
+                let invalid_url = py.import("snekwest.exceptions")?.getattr("InvalidURL")?;
+                return Err(PyErr::from_value(
+                    invalid_url.call1((format!("Invalid URL {url_str:?}: No host supplied"),))?,
+                ));
+            }
+        };
+
+        // IDNA encoding for non-ASCII hosts
+        let unicode_is_ascii_fn = py
+            .import("snekwest._internal_utils")?
+            .getattr("unicode_is_ascii")?;
+        let is_ascii: bool = unicode_is_ascii_fn.call1((&host,))?.extract()?;
+
+        let host = if !is_ascii {
+            let idna = py.import("idna")?;
+            match idna.call_method(
+                "encode",
+                (&host,),
+                Some(&[("uts46", true)].into_py_dict(py)?),
+            ) {
+                Ok(encoded) => {
+                    let decoded: String = encoded.call_method1("decode", ("utf-8",))?.extract()?;
+                    decoded
+                }
+                Err(_) => {
+                    let invalid_url = py.import("snekwest.exceptions")?.getattr("InvalidURL")?;
+                    return Err(PyErr::from_value(
+                        invalid_url.call1(("URL has an invalid label.",))?,
+                    ));
+                }
+            }
+        } else if host.starts_with('*') || host.starts_with('.') {
+            let invalid_url = py.import("snekwest.exceptions")?.getattr("InvalidURL")?;
+            return Err(PyErr::from_value(
+                invalid_url.call1(("URL has an invalid label.",))?,
+            ));
+        } else {
+            host
+        };
+
+        // Reconstruct netloc
+        let mut netloc = auth.unwrap_or_default();
+        if !netloc.is_empty() {
+            netloc.push('@');
+        }
+        netloc.push_str(&host);
+        if let Some(p) = port {
+            netloc.push_str(&format!(":{}", p));
+        }
+
+        let path = match path {
+            Some(p) if !p.is_empty() => p,
+            _ => "/".to_string(),
+        };
+
+        // Handle params
+        let params_obj = params.and_then(|p| if p.is_none() { None } else { Some(p.clone()) });
+
+        let query = if let Some(params_val) = params_obj {
+            // Convert string/bytes params
+            let to_native_string = py
+                .import("snekwest._internal_utils")?
+                .getattr("to_native_string")?;
+            let params_val = if params_val.is_instance_of::<PyString>()
+                || params_val.is_instance_of::<PyBytes>()
+            {
+                to_native_string.call1((&params_val,))?
+            } else {
+                params_val
+            };
+
+            let enc_params = encode_params(py, &params_val)?;
+            let enc_str: String = enc_params.extract(py)?;
+
+            if !enc_str.is_empty() {
+                match query {
+                    Some(q) if !q.is_empty() => Some(format!("{}&{}", q, enc_str)),
+                    _ => Some(enc_str),
+                }
+            } else {
+                query
+            }
+        } else {
+            query
+        };
+
+        // Build URL with urlunparse
+        let urlunparse = py.import("urllib.parse")?.getattr("urlunparse")?;
+        let parts = PyList::new(
+            py,
+            &[
+                scheme.as_str(),
+                &netloc,
+                &path,
+                "",
+                query.as_deref().unwrap_or(""),
+                fragment.as_deref().unwrap_or(""),
+            ],
+        )?;
+
+        let raw_url: String = urlunparse.call1((&parts,))?.extract()?;
+
+        // requote_uri
+        let requote = py.import("snekwest.utils")?.getattr("requote_uri")?;
+        let final_url: String = requote.call1((&raw_url,))?.extract()?;
+
+        self.url = Some(final_url);
+        Ok(())
+    }
+
+    fn prepare_headers_impl(
+        &mut self,
+        py: Python<'_>,
+        headers: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        // Create a new CaseInsensitiveDict
+        let cid_type = py
+            .import("snekwest.structures")?
+            .getattr("CaseInsensitiveDict")?;
+        let new_cid = cid_type.call0()?;
+        self.headers_inner = Some(new_cid.cast::<CaseInsensitiveDict>()?.clone().unbind());
+
+        if let Some(hdrs) = headers {
+            if !hdrs.is_none() {
+                let items = hdrs.call_method0("items")?;
+                let check_header_validity = py
+                    .import("snekwest.utils")?
+                    .getattr("check_header_validity")?;
+                let to_native_string = py
+                    .import("snekwest._internal_utils")?
+                    .getattr("to_native_string")?;
+
+                for item in items.try_iter()? {
+                    let item = item?;
+                    // Check validity
+                    check_header_validity.call1((&item,))?;
+
+                    let name = item.get_item(0)?;
+                    let value = item.get_item(1)?;
+                    let native_name: String =
+                        to_native_string.call1((&name,))?.extract()?;
+
+                    let headers_ref = self.headers_inner.as_ref().unwrap();
+                    headers_ref
+                        .bind(py)
+                        .borrow_mut()
+                        .set_item(py, &native_name, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_body_impl(
+        &mut self,
+        py: Python<'_>,
+        data: Option<&Bound<'_, PyAny>>,
+        files: Option<&Bound<'_, PyAny>>,
+        json: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let mut body: Option<Py<PyAny>> = None;
+        let mut content_type: Option<String> = None;
+
+        let has_data = data.map_or(false, |d| !d.is_none() && d.is_truthy().unwrap_or(false));
+        let has_json = json.map_or(false, |j| !j.is_none());
+        let has_files = files.map_or(false, |f| !f.is_none() && f.is_truthy().unwrap_or(false));
+
+        // JSON body
+        if !has_data && has_json {
+            content_type = Some("application/json".to_string());
+            let json_mod = py.import("json")?;
+            let json_val = json.unwrap();
+            let allow_nan = false.into_pyobject(py)?.to_owned().into_any();
+            let kwargs = [("allow_nan", allow_nan)].into_py_dict(py)?;
+            let dumped = match json_mod.call_method("dumps", (json_val,), Some(&kwargs)) {
+                Ok(s) => s,
+                Err(e) => {
+                    let invalid_json = py
+                        .import("snekwest.exceptions")?
+                        .getattr("InvalidJSONError")?;
+                    let kwargs = [("request", py.None())].into_py_dict(py)?;
+                    return Err(PyErr::from_value(
+                        invalid_json.call((e.value(py),), Some(&kwargs))?,
+                    ));
+                }
+            };
+
+            // Ensure it's bytes
+            if dumped.is_instance_of::<PyBytes>() {
+                body = Some(dumped.unbind());
+            } else {
+                body = Some(dumped.call_method1("encode", ("utf-8",))?.unbind());
+            }
+        }
+
+        // Check if data is a stream
+        let is_stream = if let Some(d) = data {
+            if d.is_none() {
+                false
+            } else {
+                let has_iter = d.hasattr("__iter__")?;
+                let is_string = d.is_instance_of::<PyString>();
+                let is_bytes = d.is_instance_of::<PyBytes>();
+                let is_list = d.is_instance(&py.get_type::<PyList>().as_any())?;
+                let is_tuple = d.is_instance(&py.get_type::<PyTuple>().as_any())?;
+                let mapping_cls = py.import("collections.abc")?.getattr("Mapping")?;
+                let is_mapping = d.is_instance(&mapping_cls)?;
+
+                has_iter && !is_string && !is_bytes && !is_list && !is_tuple && !is_mapping
+            }
+        } else {
+            false
+        };
+
+        if is_stream {
+            let data = data.unwrap();
+            let super_len = py.import("snekwest.utils")?.getattr("super_len")?;
+            let length: Option<u64> = match super_len.call1((data,)) {
+                Ok(l) => l.extract().ok(),
+                Err(_) => None,
+            };
+
+            body = Some(data.clone().unbind());
+
+            // Save body position
+            if data.hasattr("tell")? {
+                match data.call_method0("tell") {
+                    Ok(pos) => {
+                        self.body_position_inner = Some(pos.unbind());
+                    }
+                    Err(_) => {
+                        // Use object() as sentinel
+                        let obj = py.import("builtins")?.getattr("object")?.call0()?;
+                        self.body_position_inner = Some(obj.unbind());
+                    }
+                }
+            }
+
+            if has_files {
+                return Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
+                    "Streamed bodies and files are mutually exclusive.",
+                ));
+            }
+
+            let headers = self.headers_inner.as_ref().unwrap();
+
+            // Python: `if length:` treats 0 as falsy → sets Transfer-Encoding
+            match length {
+                Some(len) if len > 0 => {
+                    let len_str = PyString::new(py, &len.to_string());
+                    headers.bind(py).borrow_mut().set_item(
+                        py,
+                        "Content-Length",
+                        len_str.into_any(),
+                    )?;
+                }
+                _ => {
+                    let chunked = PyString::new(py, "chunked");
+                    headers.bind(py).borrow_mut().set_item(
+                        py,
+                        "Transfer-Encoding",
+                        chunked.into_any(),
+                    )?;
+                }
+            }
+        } else {
+            // Non-streaming body
+            if has_files {
+                let data_arg = data.map_or_else(|| py.None().into_bound(py), |d| d.clone());
+                let files_val = files.unwrap();
+                let result = encode_files(py, files_val, &data_arg)?;
+                let tuple = result.bind(py);
+                body = Some(tuple.get_item(0)?.unbind());
+                content_type = Some(tuple.get_item(1)?.extract()?);
+            } else if has_data {
+                let data = data.unwrap();
+                let enc = encode_params(py, data)?;
+                body = Some(enc);
+
+                // Determine content type
+                let basestring = py.import("snekwest.compat")?.getattr("basestring")?;
+                if !data.is_instance(&basestring)? && !data.hasattr("read")? {
+                    content_type = Some("application/x-www-form-urlencoded".to_string());
+                }
+            }
+
+            // Set content length for non-streaming
+            if let Some(ref b) = body {
+                let body_clone = b.clone_ref(py);
+                self.prepare_content_length_impl(py, body_clone.bind(py))?;
+            } else if body.is_none() && json.is_none() {
+                let none_obj = py.None().into_bound(py);
+                self.prepare_content_length_impl(py, &none_obj)?;
+            }
+
+            if let Some(ct) = &content_type {
+                let headers = self.headers_inner.as_ref().unwrap();
+                if !headers.bind(py).borrow().contains("content-type") {
+                    let ct_str = PyString::new(py, ct);
+                    headers
+                        .bind(py)
+                        .borrow_mut()
+                        .set_item(py, "Content-Type", ct_str.into_any())?;
+                }
+            }
+        }
+
+        self.body = body;
+        Ok(())
+    }
+
+    fn prepare_content_length_impl(
+        &mut self,
+        py: Python<'_>,
+        body: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let headers = self.headers_inner.as_ref().unwrap();
+
+        if !body.is_none() {
+            let super_len = py.import("snekwest.utils")?.getattr("super_len")?;
+            let length: u64 = super_len.call1((body,))?.extract().unwrap_or(0);
+            if length > 0 {
+                let len_str = PyString::new(py, &length.to_string());
+                headers
+                    .bind(py)
+                    .borrow_mut()
+                    .set_item(py, "Content-Length", len_str.into_any())?;
+            }
+        } else {
+            // No body: set Content-Length: 0 for non-GET/HEAD
+            let method = self.method.as_deref().unwrap_or("");
+            if method != "GET" && method != "HEAD" {
+                let cl = headers.bind(py).borrow().get_value(py, "Content-Length");
+                if cl.is_none() {
+                    let zero = PyString::new(py, "0");
+                    headers
+                        .bind(py)
+                        .borrow_mut()
+                        .set_item(py, "Content-Length", zero.into_any())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_auth_impl(
+        &mut self,
+        py: Python<'_>,
+        auth: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let auth = if let Some(a) = auth {
+            if a.is_none() {
+                None
+            } else {
+                Some(a.clone())
+            }
+        } else {
+            None
+        };
+
+        let auth = match auth {
+            Some(a) => Some(a),
+            None => {
+                // Try to get auth from URL
+                if let Some(ref url) = self.url {
+                    let get_auth = py
+                        .import("snekwest.utils")?
+                        .getattr("get_auth_from_url")?;
+                    let url_auth = get_auth.call1((url.as_str(),))?;
+                    let any_fn = py.import("builtins")?.getattr("any")?;
+                    let has_auth: bool = any_fn.call1((&url_auth,))?.extract()?;
+                    if has_auth {
+                        Some(url_auth)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(auth_val) = auth {
+            // If it's a tuple of length 2, convert to HTTPBasicAuth
+            let auth_callable = if let Ok(tuple) = auth_val.cast::<PyTuple>() {
+                if tuple.len() == 2 {
+                    let http_basic_auth =
+                        py.import("snekwest.auth")?.getattr("HTTPBasicAuth")?;
+                    http_basic_auth.call1((tuple.get_item(0)?, tuple.get_item(1)?))?
+                } else {
+                    auth_val
+                }
+            } else {
+                auth_val
+            };
+
+            // Call auth(self) - auth modifies our headers in-place and returns self
+            // We need to create a temporary Python object for self
+            let self_ref = Py::new(
+                py,
+                PreparedRequest {
+                    method: self.method.clone(),
+                    url: self.url.clone(),
+                    headers_inner: self.headers_inner.as_ref().map(|h| h.clone_ref(py)),
+                    body: self.body.as_ref().map(|b| b.clone_ref(py)),
+                    hooks_inner: self.hooks_inner.clone_ref(py),
+                    cookies_inner: self.cookies_inner.as_ref().map(|c| c.clone_ref(py)),
+                    body_position_inner: self
+                        .body_position_inner
+                        .as_ref()
+                        .map(|p| p.clone_ref(py)),
+                },
+            )?;
+
+            let result = auth_callable.call1((&self_ref,))?;
+
+            // Copy fields back from the result
+            if let Ok(r) = result.cast::<PreparedRequest>() {
+                let r = r.borrow();
+                self.method = r.method.clone();
+                self.url = r.url.clone();
+                self.headers_inner = r.headers_inner.as_ref().map(|h| h.clone_ref(py));
+                self.body = r.body.as_ref().map(|b| b.clone_ref(py));
+                self.hooks_inner = r.hooks_inner.clone_ref(py);
+                self.cookies_inner = r.cookies_inner.as_ref().map(|c| c.clone_ref(py));
+                self.body_position_inner =
+                    r.body_position_inner.as_ref().map(|p| p.clone_ref(py));
+            }
+
+            // Re-prepare content length
+            if let Some(body) = &self.body {
+                let body_clone = body.clone_ref(py);
+                self.prepare_content_length_impl(py, body_clone.bind(py))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_cookies_impl(
+        &mut self,
+        py: Python<'_>,
+        cookies: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let cookie_jar_cls = py.import("http.cookiejar")?.getattr("CookieJar")?;
+        let cookiejar_from_dict = py
+            .import("snekwest.cookies")?
+            .getattr("cookiejar_from_dict")?;
+
+        if let Some(c) = cookies {
+            if !c.is_none() {
+                if c.is_instance(&cookie_jar_cls)? {
+                    self.cookies_inner = Some(c.clone().unbind());
+                } else {
+                    self.cookies_inner = Some(cookiejar_from_dict.call1((c,))?.unbind());
+                }
+            } else {
+                self.cookies_inner = Some(cookiejar_from_dict.call1((py.None(),))?.unbind());
+            }
+        } else {
+            self.cookies_inner = Some(cookiejar_from_dict.call1((py.None(),))?.unbind());
+        }
+
+        // Get cookie header - we need to pass an object with .url and .headers
+        let get_cookie_header = py
+            .import("snekwest.cookies")?
+            .getattr("get_cookie_header")?;
+
+        let cookies_ref = self.cookies_inner.as_ref().unwrap();
+
+        // Create a SimpleNamespace with the fields get_cookie_header needs
+        let types_mod = py.import("types")?;
+        let ns_cls = types_mod.getattr("SimpleNamespace")?;
+        let ns = PyDict::new(py);
+        ns.set_item("url", &self.url)?;
+        ns.set_item(
+            "headers",
+            self.headers_inner.as_ref().map_or_else(
+                || py.None().into_bound(py),
+                |h| h.bind(py).clone().into_any(),
+            ),
+        )?;
+        ns.set_item("_cookies", cookies_ref.bind(py))?;
+        let request_obj = ns_cls.call((), Some(&ns))?;
+
+        let cookie_header = get_cookie_header.call1((cookies_ref.bind(py), &request_obj))?;
+
+        if !cookie_header.is_none() {
+            if let Some(ref headers) = self.headers_inner {
+                headers
+                    .bind(py)
+                    .borrow_mut()
+                    .set_item(py, "Cookie", cookie_header)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_hooks_impl(
+        &mut self,
+        py: Python<'_>,
+        hooks: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        if let Some(h) = hooks {
+            if !h.is_none() {
+                // Iterate over hooks dict
+                let items = match h.call_method0("items") {
+                    Ok(items) => items,
+                    Err(_) => return Ok(()),
+                };
+                for item in items.try_iter()? {
+                    let item = item?;
+                    let event: String = item.get_item(0)?.extract()?;
+                    let hook = item.get_item(1)?;
+                    self.register_hook(py, &event, &hook)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+/// Encode parameters (delegates to Python)
+fn encode_params(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    // If string or bytes, return as-is
+    if data.is_instance_of::<PyString>() || data.is_instance_of::<PyBytes>() {
+        return Ok(data.clone().unbind());
+    }
+
+    // If has read(), return as-is (file-like)
+    if data.hasattr("read")? {
+        return Ok(data.clone().unbind());
+    }
+
+    // If iterable, encode
+    if data.hasattr("__iter__")? {
+        let to_key_val_list = py
+            .import("snekwest.utils")?
+            .getattr("to_key_val_list")?;
+        let kvl = to_key_val_list.call1((data,))?;
+        let urlencode = py.import("urllib.parse")?.getattr("urlencode")?;
+        let basestring = py.import("snekwest.compat")?.getattr("basestring")?;
+
+        let result = PyList::empty(py);
+        for pair in kvl.try_iter()? {
+            let pair = pair?;
+            let k = pair.get_item(0)?;
+            let vs = pair.get_item(1)?;
+
+            let vs_list = if vs.is_instance(&basestring)? || !vs.hasattr("__iter__")? {
+                let l = PyList::empty(py);
+                l.append(&vs)?;
+                l.into_any()
+            } else {
+                vs.clone()
+            };
+
+            for v in vs_list.try_iter()? {
+                let v = v?;
+                if !v.is_none() {
+                    let k_encoded = if k.is_instance_of::<PyString>() {
+                        k.call_method1("encode", ("utf-8",))?
+                    } else {
+                        k.clone()
+                    };
+                    let v_encoded = if v.is_instance_of::<PyString>() {
+                        v.call_method1("encode", ("utf-8",))?
+                    } else {
+                        v.clone()
+                    };
+                    let t = PyTuple::new(py, &[k_encoded, v_encoded])?;
+                    result.append(&t)?;
+                }
+            }
+        }
+
+        let kwargs = [("doseq", true)].into_py_dict(py)?;
+        let encoded = urlencode.call((result,), Some(&kwargs))?;
+        return Ok(encoded.unbind());
+    }
+
+    Ok(data.clone().unbind())
+}
+
+/// Encode files for multipart upload (delegates to Python)
+fn encode_files(
+    py: Python<'_>,
+    files: &Bound<'_, PyAny>,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let models_mod = py.import("snekwest.models")?;
+    let encode_fn = models_mod.getattr("_encode_files")?;
+    Ok(encode_fn.call1((files, data))?.unbind())
+}

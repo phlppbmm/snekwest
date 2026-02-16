@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use pyo3::types::{IntoPyDict, PyBool, PyDict};
 use pythonize::depythonize;
 use reqwest::blocking::{Client, ClientBuilder};
 use std::collections::HashMap;
@@ -9,7 +10,7 @@ use std::time::Instant;
 use crate::exceptions::{raise_exception, raise_nested_exception};
 use crate::request_params::CertParameter;
 use crate::request_params::{DataParameter, RequestParams, TimeoutParameter, VerifyParameter};
-use crate::response::Response;
+use crate::response::{RawResponseData, Response, StreamingInner};
 
 const MAX_REDIRECTS: usize = 30;
 
@@ -424,18 +425,36 @@ fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
     Ok(())
 }
 
-#[pyclass]
+#[pyclass(subclass, dict)]
 pub struct Session {
+    // Internal transport state (used by make_request/do_request chain)
     clients: Mutex<HashMap<ClientConfig, Arc<Client>>>,
     cookie_jar: Mutex<HashMap<String, String>>,
+    // Python-facing session attributes
     #[pyo3(get, set)]
-    max_redirects: usize,
+    pub headers: Py<PyAny>,
     #[pyo3(get, set)]
-    default_headers: Option<HashMap<String, String>>,
+    pub cookies: Py<PyAny>,
     #[pyo3(get, set)]
-    default_auth: Option<(String, String)>,
+    pub auth: Py<PyAny>,
     #[pyo3(get, set)]
-    default_params: Option<HashMap<String, String>>,
+    pub proxies: Py<PyAny>,
+    #[pyo3(get, set)]
+    pub hooks: Py<PyAny>,
+    #[pyo3(get, set)]
+    pub params: Py<PyAny>,
+    #[pyo3(get, set)]
+    pub stream: bool,
+    #[pyo3(get, set)]
+    pub verify: Py<PyAny>,
+    #[pyo3(get, set)]
+    pub cert: Py<PyAny>,
+    #[pyo3(get, set)]
+    pub max_redirects: usize,
+    #[pyo3(get, set)]
+    pub trust_env: bool,
+    #[pyo3(get, set)]
+    pub adapters: Py<PyAny>,
 }
 
 impl Session {
@@ -482,11 +501,8 @@ impl Session {
             url,
         );
 
-        // Merge default params with request params
+        // Merge request params
         let mut merged_params: HashMap<String, String> = HashMap::new();
-        if let Some(default_params) = &self.default_params {
-            merged_params.extend(default_params.clone());
-        }
         if let Some(query_params) = &params.params {
             merged_params.extend(query_params.clone());
         }
@@ -792,7 +808,7 @@ impl Session {
         })
     }
 
-    fn do_request(&self, mut params: RequestParams) -> PyResult<Response> {
+    fn do_request(&self, mut params: RequestParams) -> PyResult<RawResponseData> {
         let client = self.get_or_create_client(&params)?;
         let start = Instant::now();
 
@@ -807,11 +823,9 @@ impl Session {
         let request_url = params.url.clone();
         let has_request_cookies = params.cookies.is_some();
 
-        // Determine auth: request auth overrides session auth
-        let auth = params.auth.clone().or_else(|| self.default_auth.clone());
-
-        // Merge default headers
-        let extra_headers = self.default_headers.clone();
+        // Determine auth from request params
+        let auth = params.auth.clone();
+        let extra_headers: Option<HashMap<String, String>> = None;
 
         // Build merged cookies for the first request
         let merged_cookies = self.merge_cookies(&params);
@@ -820,7 +834,7 @@ impl Session {
         // We'll capture them from the first redirect step
         let mut current_method = original_method.clone();
         let mut current_url = request_url.clone();
-        let mut history: Vec<Response> = Vec::new();
+        let mut history: Vec<RawResponseData> = Vec::new();
         let mut current_cookies = merged_cookies;
         let mut current_auth = auth.clone();
         let max_redirects = if params.allow_redirects {
@@ -929,20 +943,22 @@ impl Session {
                                 final_url.push_str(fragment);
                             }
                         }
-                        return Ok(Response::new(
+                        return Ok(RawResponseData {
                             status,
-                            final_url,
-                            resp_headers,
+                            url: final_url,
+                            headers: resp_headers,
                             body,
                             elapsed_ms,
                             history,
-                            resp_cookies,
+                            cookies: resp_cookies,
                             reason,
-                            is_redir,
-                            current_method,
+                            is_redirect: is_redir,
+                            method: current_method,
                             request_url,
-                            final_request_headers,
-                        ));
+                            request_headers: final_request_headers,
+                            streaming_inner: None,
+                            streaming_headers: None,
+                        });
                     }
                 };
 
@@ -955,20 +971,22 @@ impl Session {
                 let body = response.bytes().unwrap_or_default().to_vec();
 
                 // Build intermediate response for history
-                let intermediate = Response::new(
+                let intermediate = RawResponseData {
                     status,
-                    resp_url,
-                    resp_headers,
+                    url: resp_url,
+                    headers: resp_headers,
                     body,
-                    0.0, // elapsed not relevant for intermediates
-                    Vec::new(),
-                    resp_cookies,
+                    elapsed_ms: 0.0,
+                    history: Vec::new(),
+                    cookies: resp_cookies,
                     reason,
-                    true,
-                    current_method.clone(),
-                    current_url.clone(),
-                    req_headers.clone(),
-                );
+                    is_redirect: true,
+                    method: current_method.clone(),
+                    request_url: current_url.clone(),
+                    request_headers: req_headers.clone(),
+                    streaming_inner: None,
+                    streaming_headers: None,
+                };
                 history.push(intermediate);
 
                 let previous_url = current_url.clone();
@@ -1037,15 +1055,20 @@ impl Session {
             let resp_url = response.url().to_string();
 
             // For streaming requests with chunked transfer (no Content-Length),
-            // skip body reading to avoid hangs — the server may not close the
-            // connection promptly.  Non-chunked streaming (has Content-Length)
-            // is safe to read eagerly.
+            // create a StreamingBody for lazy chunk-at-a-time reading instead
+            // of calling response.bytes() which hangs when the server doesn't
+            // close the connection promptly.
             let is_stream = params.stream.unwrap_or(false);
             let has_content_length = response.headers().contains_key("content-length");
-            let body = if is_stream && !has_content_length {
-                Vec::new()
+            let streaming = is_stream && !has_content_length;
+
+            // Consume response in exactly one branch to satisfy the borrow checker.
+            // For streaming, wrap in Arc<Mutex> for lazy reading; otherwise read eagerly.
+            let (body, streaming_inner_opt) = if streaming {
+                let inner = StreamingInner(Arc::new(Mutex::new(Some(response))));
+                (Vec::new(), Some(inner))
             } else {
-                response.bytes().unwrap_or_default().to_vec()
+                (response.bytes().unwrap_or_default().to_vec(), None)
             };
 
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1062,20 +1085,28 @@ impl Session {
                 }
             }
 
-            return Ok(Response::new(
+            let streaming_hdrs = if streaming_inner_opt.is_some() {
+                Some(resp_headers.clone())
+            } else {
+                None
+            };
+
+            return Ok(RawResponseData {
                 status,
-                final_url,
-                resp_headers,
+                url: final_url,
+                headers: resp_headers,
                 body,
                 elapsed_ms,
                 history,
-                resp_cookies,
+                cookies: resp_cookies,
                 reason,
-                is_redir,
-                current_method,
+                is_redirect: is_redir,
+                method: current_method,
                 request_url,
-                final_request_headers,
-            ));
+                request_headers: final_request_headers,
+                streaming_inner: streaming_inner_opt,
+                streaming_headers: streaming_hdrs,
+            });
         }
 
         // Should not be reached, but just in case
@@ -1088,15 +1119,35 @@ impl Session {
 #[pymethods]
 impl Session {
     #[new]
-    fn new() -> Self {
-        Session {
+    fn new(py: Python<'_>) -> PyResult<Self> {
+        let utils = py.import("snekwest.utils")?;
+        let py_headers = utils.getattr("default_headers")?.call0()?.unbind();
+        let cookies_mod = py.import("snekwest.cookies")?;
+        let py_cookies = cookies_mod
+            .getattr("cookiejar_from_dict")?
+            .call1((PyDict::new(py),))?
+            .unbind();
+        let hooks_mod = py.import("snekwest.hooks")?;
+        let py_hooks = hooks_mod.getattr("default_hooks")?.call0()?.unbind();
+        let adapters_cls = py.import("collections")?.getattr("OrderedDict")?;
+        let py_adapters = adapters_cls.call0()?.unbind();
+
+        Ok(Session {
             clients: Mutex::new(HashMap::new()),
             cookie_jar: Mutex::new(HashMap::new()),
+            headers: py_headers,
+            cookies: py_cookies,
+            auth: py.None().into(),
+            proxies: PyDict::new(py).into_any().unbind(),
+            hooks: py_hooks,
+            params: PyDict::new(py).into_any().unbind(),
+            stream: false,
+            verify: PyBool::new(py, true).to_owned().into_any().unbind(),
+            cert: py.None().into(),
             max_redirects: MAX_REDIRECTS,
-            default_headers: None,
-            default_auth: None,
-            default_params: None,
-        }
+            trust_env: true,
+            adapters: py_adapters,
+        })
     }
 
     #[pyo3(signature = (
@@ -1139,7 +1190,7 @@ impl Session {
         // Validate URL first
         validate_url(py, &url)?;
 
-        let params = RequestParams::from_args(
+        let req_params = RequestParams::from_args(
             method,
             url,
             params,
@@ -1157,33 +1208,525 @@ impl Session {
             cert,
         );
 
-        self.do_request(params)
+        let raw = self.do_request(req_params)?;
+        Response::from_raw(py, raw)
     }
 
-    fn close(&self) {
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        // Close all adapters
+        let adapters = self.adapters.bind(py);
+        let builtins = py.import("builtins").ok();
+        if let Ok(values) = adapters.call_method0("values") {
+            let values_as_list = builtins.and_then(|b| b.getattr("list").ok())
+                .and_then(|list_fn| list_fn.call1((&values,)).ok());
+            if let Ok(values_list) = values_as_list.unwrap_or(values).extract::<Vec<Py<PyAny>>>() {
+                for adapter in values_list {
+                    let _ = adapter.call_method0(py, "close");
+                }
+            }
+        }
+        // Clear internal state
         let mut clients = self.clients.lock().unwrap();
         clients.clear();
         let mut cookies = self.cookie_jar.lock().unwrap();
         cookies.clear();
+        Ok(())
     }
 
-    fn get_cookies(&self) -> HashMap<String, String> {
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __exit__(&self, py: Python<'_>, _exc_type: &Bound<'_, PyAny>, _exc_val: &Bound<'_, PyAny>, _exc_tb: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.close(py)
+    }
+
+    fn mount(&self, py: Python<'_>, prefix: String, adapter: Py<PyAny>) -> PyResult<()> {
+        let adapters = self.adapters.bind(py);
+        adapters.set_item(&prefix, &adapter)?;
+        // Move shorter-prefix keys to end (maintains longest-prefix-first order)
+        let prefix_len = prefix.len();
+        let builtins = py.import("builtins")?;
+        let keys_list: Vec<String> = builtins.getattr("list")?
+            .call1((adapters.call_method0("keys")?,))?
+            .extract::<Vec<String>>()?;
+        for key in &keys_list {
+            if key.len() < prefix_len {
+                let val = adapters.get_item(key)?;
+                adapters.call_method1("__delitem__", (key.as_str(),))?;
+                adapters.set_item(key, val)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn get_adapter(&self, py: Python<'_>, url: String) -> PyResult<Py<PyAny>> {
+        let adapters = self.adapters.bind(py);
+        let url_lower = url.to_lowercase();
+        let builtins = py.import("builtins")?;
+        let items_list: Vec<(String, Py<PyAny>)> = builtins.getattr("list")?
+            .call1((adapters.call_method0("items")?,))?
+            .extract::<Vec<(String, Py<PyAny>)>>()?;
+        for (prefix, adapter) in items_list {
+            if url_lower.starts_with(&prefix.to_lowercase()) {
+                return Ok(adapter);
+            }
+        }
+        let exc_mod = py.import("snekwest.exceptions")?;
+        let invalid_schema = exc_mod.getattr("InvalidSchema")?;
+        Err(PyErr::from_value(
+            invalid_schema.call1((format!("No connection adapters were found for {url:?}"),))?
+        ))
+    }
+
+    fn get_cookies_internal(&self) -> HashMap<String, String> {
         let jar = self.cookie_jar.lock().unwrap();
         jar.clone()
     }
 
-    fn set_cookies(&self, cookies: HashMap<String, String>) {
+    fn set_cookies_internal(&self, cookies: HashMap<String, String>) {
         let mut jar = self.cookie_jar.lock().unwrap();
         jar.extend(cookies);
     }
 
-    fn set_cookie(&self, key: String, value: String) {
+    fn set_cookie_internal(&self, key: String, value: String) {
         let mut jar = self.cookie_jar.lock().unwrap();
         jar.insert(key, value);
     }
 
-    fn remove_cookie(&self, key: &str) {
+    fn remove_cookie_internal(&self, key: &str) {
         let mut jar = self.cookie_jar.lock().unwrap();
         jar.remove(key);
     }
+
+    fn prepare_request(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let sessions_mod = py.import("snekwest.sessions")?;
+        let merge_setting = sessions_mod.getattr("merge_setting")?;
+        let merge_hooks_fn = sessions_mod.getattr("merge_hooks")?;
+        let cookies_mod = py.import("snekwest.cookies")?;
+        let merge_cookies_fn = cookies_mod.getattr("merge_cookies")?;
+        let rcj_cls = cookies_mod.getattr("RequestsCookieJar")?;
+        let cookiejar_from_dict = cookies_mod.getattr("cookiejar_from_dict")?;
+        let cid_cls = py.import("snekwest.structures")?.getattr("CaseInsensitiveDict")?;
+
+        // Merge cookies: session cookies + request cookies
+        let req_cookies = request.getattr("cookies")?;
+        let req_cookies = if req_cookies.is_none() || (req_cookies.is_instance_of::<PyDict>() && req_cookies.len()? == 0) {
+            cookiejar_from_dict.call1((PyDict::new(py),))?
+        } else {
+            let cookielib = py.import("http.cookiejar")?;
+            let cj_cls = cookielib.getattr("CookieJar")?;
+            if req_cookies.is_instance(&cj_cls)? {
+                req_cookies
+            } else {
+                cookiejar_from_dict.call1((&req_cookies,))?
+            }
+        };
+        let merged_cookies = merge_cookies_fn.call1((
+            merge_cookies_fn.call1((rcj_cls.call0()?, &self.cookies.bind(py)))?,
+            &req_cookies,
+        ))?;
+
+        // Auth: trust_env netrc lookup (use is_truthy to match Python's `not auth`)
+        let mut auth = request.getattr("auth")?;
+        if self.trust_env && !auth.is_truthy()? && !self.auth.bind(py).is_truthy()? {
+            // Use sessions module's get_netrc_auth so monkey-patching works
+            let sessions_mod = py.import("snekwest.sessions")?;
+            let netrc_auth = sessions_mod.getattr("get_netrc_auth")?.call1((request.getattr("url")?,))?;
+            if !netrc_auth.is_none() {
+                auth = netrc_auth;
+            }
+        }
+
+        // Create and prepare PreparedRequest
+        let prep_cls = py.import("snekwest.models")?.getattr("PreparedRequest")?;
+        let p = prep_cls.call0()?;
+        let kwargs_dict = PyDict::new(py);
+        kwargs_dict.set_item("dict_class", &cid_cls)?;
+        let merged_headers = merge_setting.call((
+            request.getattr("headers")?,
+            &self.headers.bind(py),
+        ), Some(&kwargs_dict))?;
+        let merged_params = merge_setting.call1((
+            request.getattr("params")?,
+            &self.params.bind(py),
+        ))?;
+        let merged_auth = merge_setting.call1((&auth, &self.auth.bind(py)))?;
+        let merged_hooks = merge_hooks_fn.call1((
+            request.getattr("hooks")?,
+            &self.hooks.bind(py),
+        ))?;
+
+        let prepare_kwargs = PyDict::new(py);
+        prepare_kwargs.set_item("method", request.getattr("method")?.call_method0("upper")?)?;
+        prepare_kwargs.set_item("url", request.getattr("url")?)?;
+        prepare_kwargs.set_item("files", request.getattr("files")?)?;
+        prepare_kwargs.set_item("data", request.getattr("data")?)?;
+        prepare_kwargs.set_item("json", request.getattr("json")?)?;
+        prepare_kwargs.set_item("headers", &merged_headers)?;
+        prepare_kwargs.set_item("params", &merged_params)?;
+        prepare_kwargs.set_item("auth", &merged_auth)?;
+        prepare_kwargs.set_item("cookies", &merged_cookies)?;
+        prepare_kwargs.set_item("hooks", &merged_hooks)?;
+        p.call_method("prepare", (), Some(&prepare_kwargs))?;
+
+        Ok(p.unbind())
+    }
+
+    fn merge_environment_settings(
+        &self,
+        py: Python<'_>,
+        url: Bound<'_, PyAny>,
+        proxies: Bound<'_, PyAny>,
+        stream: Bound<'_, PyAny>,
+        verify: Bound<'_, PyAny>,
+        cert: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let sessions_mod = py.import("snekwest.sessions")?;
+        let merge_setting = sessions_mod.getattr("merge_setting")?;
+        let os = py.import("os")?;
+
+        let mut proxies = proxies.unbind();
+        let mut verify = verify.unbind();
+
+        if self.trust_env {
+            let utils = py.import("snekwest.utils")?;
+            let no_proxy = proxies.bind(py).call_method1("get", ("no_proxy",))?;
+            let no_proxy_kw = PyDict::new(py);
+            no_proxy_kw.set_item("no_proxy", &no_proxy)?;
+            let env_proxies = utils.getattr("get_environ_proxies")?.call((&url,), Some(&no_proxy_kw))?;
+            // setdefault for each env proxy
+            let env_items = env_proxies.call_method0("items")?;
+            let builtins = py.import("builtins")?;
+            let env_items_list: Vec<(String, Py<PyAny>)> = builtins.getattr("list")?
+                .call1((&env_items,))?.extract()?;
+            for (k, v) in env_items_list {
+                proxies.bind(py).call_method1("setdefault", (k, v))?;
+            }
+            // Check REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE
+            let verify_bound = verify.bind(py);
+            let py_true = PyBool::new(py, true);
+            if verify_bound.is(py_true) || verify_bound.is_none() {
+                // Replicate: verify = os.environ.get("REQUESTS_CA_BUNDLE")
+                //                  or os.environ.get("CURL_CA_BUNDLE")
+                //                  or verify
+                let environ = os.getattr("environ")?;
+                let ca_bundle = environ.call_method1("get", ("REQUESTS_CA_BUNDLE",))?;
+                if ca_bundle.is_truthy()? {
+                    verify = ca_bundle.unbind();
+                } else {
+                    let curl_bundle = environ.call_method1("get", ("CURL_CA_BUNDLE",))?;
+                    if curl_bundle.is_truthy()? {
+                        verify = curl_bundle.unbind();
+                    }
+                    // else: keep original verify
+                }
+            }
+        }
+
+        let merged_proxies = merge_setting.call1((&proxies, &self.proxies.bind(py)))?;
+        let merged_stream = merge_setting.call1((&stream, self.stream))?;
+        let merged_verify = merge_setting.call1((&verify, &self.verify.bind(py)))?;
+        let merged_cert = merge_setting.call1((&cert, &self.cert.bind(py)))?;
+
+        let result = PyDict::new(py);
+        result.set_item("proxies", merged_proxies)?;
+        result.set_item("stream", merged_stream)?;
+        result.set_item("verify", merged_verify)?;
+        result.set_item("cert", merged_cert)?;
+        Ok(result.into_any().unbind())
+    }
+
+    #[pyo3(signature = (
+        method,
+        url,
+        *,
+        params = None,
+        data = None,
+        headers = None,
+        cookies = None,
+        files = None,
+        auth = None,
+        timeout = None,
+        allow_redirects = true,
+        proxies = None,
+        hooks = None,
+        stream = None,
+        verify = None,
+        cert = None,
+        json = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn request(
+        slf: &Bound<'_, Self>,
+        method: Py<PyAny>,
+        url: String,
+        params: Option<Py<PyAny>>,
+        data: Option<Py<PyAny>>,
+        headers: Option<Py<PyAny>>,
+        cookies: Option<Py<PyAny>>,
+        files: Option<Py<PyAny>>,
+        auth: Option<Py<PyAny>>,
+        timeout: Option<Py<PyAny>>,
+        allow_redirects: bool,
+        proxies: Option<Py<PyAny>>,
+        hooks: Option<Py<PyAny>>,
+        stream: Option<Py<PyAny>>,
+        verify: Option<Py<PyAny>>,
+        cert: Option<Py<PyAny>>,
+        json: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let models_mod = py.import("snekwest.models")?;
+        let request_cls = models_mod.getattr("Request")?;
+
+        let req_build_kwargs = PyDict::new(py);
+        // Convert method to string (supports both str and bytes)
+        let method_str: String = if let Ok(s) = method.extract::<String>(py) {
+            s
+        } else if let Ok(b) = method.extract::<Vec<u8>>(py) {
+            String::from_utf8_lossy(&b).to_string()
+        } else {
+            method.bind(py).str()?.to_string()
+        };
+        req_build_kwargs.set_item("method", method_str.to_uppercase())?;
+        req_build_kwargs.set_item("url", &url)?;
+        req_build_kwargs.set_item("headers", headers.as_ref().map_or_else(|| py.None(), |h| h.clone_ref(py)))?;
+        req_build_kwargs.set_item("files", files.as_ref().map_or_else(|| py.None(), |f| f.clone_ref(py)))?;
+        req_build_kwargs.set_item("data", data.as_ref().map_or_else(|| PyDict::new(py).into_any().unbind(), |d| d.clone_ref(py)))?;
+        req_build_kwargs.set_item("json", json.as_ref().map_or_else(|| py.None(), |j| j.clone_ref(py)))?;
+        req_build_kwargs.set_item("params", params.as_ref().map_or_else(|| PyDict::new(py).into_any().unbind(), |p| p.clone_ref(py)))?;
+        req_build_kwargs.set_item("auth", auth.as_ref().map_or_else(|| py.None(), |a| a.clone_ref(py)))?;
+        req_build_kwargs.set_item("cookies", cookies.as_ref().map_or_else(|| py.None(), |c| c.clone_ref(py)))?;
+        req_build_kwargs.set_item("hooks", hooks.as_ref().map_or_else(|| py.None(), |h| h.clone_ref(py)))?;
+
+        let req = request_cls.call((), Some(&req_build_kwargs))?;
+        let prep = slf.borrow().prepare_request(py, &req)?;
+        let prep_bound = prep.bind(py);
+
+        let py_proxies = proxies.unwrap_or_else(|| PyDict::new(py).into_any().unbind());
+        let settings = slf.borrow().merge_environment_settings(
+            py,
+            prep_bound.getattr("url")?,
+            py_proxies.into_bound(py),
+            stream.map_or_else(|| py.None().into_bound(py), |s| s.into_bound(py)),
+            verify.map_or_else(|| py.None().into_bound(py), |v| v.into_bound(py)),
+            cert.map_or_else(|| py.None().into_bound(py), |c| c.into_bound(py)),
+        )?;
+
+        let send_kwargs = PyDict::new(py);
+        send_kwargs.set_item("timeout", timeout.as_ref().map_or_else(|| py.None(), |t| t.clone_ref(py)))?;
+        send_kwargs.set_item("allow_redirects", allow_redirects)?;
+        let settings_bound = settings.bind(py);
+        if let Ok(settings_dict) = settings_bound.downcast::<PyDict>() {
+            for (k, v) in settings_dict.iter() {
+                send_kwargs.set_item(k, v)?;
+            }
+        }
+
+        // Call send via Python dispatch so it goes through the correct MRO
+        slf.call_method("send", (&prep,), Some(&send_kwargs))
+            .map(|r| r.unbind())
+    }
+
+    #[pyo3(signature = (url, **kwargs))]
+    fn get(slf: &Bound<'_, Self>, url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let kw = kwargs.map(|d| d.copy()).transpose()?.unwrap_or_else(|| PyDict::new(py).clone());
+        if !kw.contains("allow_redirects")? {
+            kw.set_item("allow_redirects", true)?;
+        }
+        slf.call_method("request", ("GET", url), Some(&kw)).map(|r| r.unbind())
+    }
+
+    #[pyo3(signature = (url, **kwargs))]
+    fn options(slf: &Bound<'_, Self>, url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let kw = kwargs.map(|d| d.copy()).transpose()?.unwrap_or_else(|| PyDict::new(py).clone());
+        if !kw.contains("allow_redirects")? {
+            kw.set_item("allow_redirects", true)?;
+        }
+        slf.call_method("request", ("OPTIONS", url), Some(&kw)).map(|r| r.unbind())
+    }
+
+    #[pyo3(signature = (url, **kwargs))]
+    fn head(slf: &Bound<'_, Self>, url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let kw = kwargs.map(|d| d.copy()).transpose()?.unwrap_or_else(|| PyDict::new(py).clone());
+        if !kw.contains("allow_redirects")? {
+            kw.set_item("allow_redirects", false)?;
+        }
+        slf.call_method("request", ("HEAD", url), Some(&kw)).map(|r| r.unbind())
+    }
+
+    #[pyo3(signature = (url, data = None, json = None, **kwargs))]
+    fn post(slf: &Bound<'_, Self>, url: String, data: Option<Py<PyAny>>, json: Option<Py<PyAny>>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let kw = kwargs.map(|d| d.copy()).transpose()?.unwrap_or_else(|| PyDict::new(py).clone());
+        kw.set_item("data", data.as_ref().map_or_else(|| py.None(), |d| d.clone_ref(py)))?;
+        kw.set_item("json", json.as_ref().map_or_else(|| py.None(), |j| j.clone_ref(py)))?;
+        slf.call_method("request", ("POST", url), Some(&kw)).map(|r| r.unbind())
+    }
+
+    #[pyo3(signature = (url, data = None, **kwargs))]
+    fn put(slf: &Bound<'_, Self>, url: String, data: Option<Py<PyAny>>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let kw = kwargs.map(|d| d.copy()).transpose()?.unwrap_or_else(|| PyDict::new(py).clone());
+        kw.set_item("data", data.as_ref().map_or_else(|| py.None(), |d| d.clone_ref(py)))?;
+        slf.call_method("request", ("PUT", url), Some(&kw)).map(|r| r.unbind())
+    }
+
+    #[pyo3(signature = (url, data = None, **kwargs))]
+    fn patch(slf: &Bound<'_, Self>, url: String, data: Option<Py<PyAny>>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let kw = kwargs.map(|d| d.copy()).transpose()?.unwrap_or_else(|| PyDict::new(py).clone());
+        kw.set_item("data", data.as_ref().map_or_else(|| py.None(), |d| d.clone_ref(py)))?;
+        slf.call_method("request", ("PATCH", url), Some(&kw)).map(|r| r.unbind())
+    }
+
+    #[pyo3(signature = (url, **kwargs))]
+    fn delete(slf: &Bound<'_, Self>, url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let kw = kwargs.map(|d| d.copy()).transpose()?.unwrap_or_else(|| PyDict::new(py).clone());
+        slf.call_method("request", ("DELETE", url), Some(&kw)).map(|r| r.unbind())
+    }
+
+    #[pyo3(signature = (request, **kwargs))]
+    fn send(slf: &Bound<'_, Self>, request: Py<PyAny>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+
+        // Validate request type
+        let models_mod = py.import("snekwest.models")?;
+        let request_cls = models_mod.getattr("Request")?;
+        if request.bind(py).is_instance(&request_cls)? {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "You can only send PreparedRequests.",
+            ));
+        }
+
+        // Create kwargs dict if not provided
+        let kwargs = match kwargs {
+            Some(kw) => kw.copy()?,
+            None => PyDict::new(py).clone(),
+        };
+
+        // Fill in defaults from session
+        {
+            let this = slf.borrow();
+            if !kwargs.contains("stream")? {
+                kwargs.set_item("stream", this.stream)?;
+            }
+            if !kwargs.contains("verify")? {
+                kwargs.set_item("verify", &this.verify)?;
+            }
+            if !kwargs.contains("cert")? {
+                kwargs.set_item("cert", &this.cert)?;
+            }
+            if !kwargs.contains("proxies")? {
+                let utils = py.import("snekwest.utils")?;
+                let resolved = utils.getattr("resolve_proxies")?.call1((
+                    &request,
+                    &this.proxies.bind(py),
+                    this.trust_env,
+                ))?;
+                kwargs.set_item("proxies", resolved)?;
+            }
+        } // drop borrow
+
+        let allow_redirects: bool = kwargs.get_item("allow_redirects")?
+            .map(|v| v.extract::<bool>())
+            .transpose()?
+            .unwrap_or(true);
+        let _ = kwargs.del_item("allow_redirects");
+
+        let stream: bool = kwargs.get_item("stream")?
+            .map(|v| v.extract::<bool>())
+            .transpose()?
+            .unwrap_or(false);
+
+        // Get hooks from request
+        let hooks = request.getattr(py, "hooks")?;
+
+        // Get adapter and send
+        let req_url: String = request.getattr(py, "url")?.extract(py)?;
+        let adapter = slf.borrow().get_adapter(py, req_url)?;
+
+        let start = std::time::Instant::now();
+        let r = adapter.bind(py).call_method(
+            "send",
+            (&request,),
+            Some(&kwargs),
+        )?;
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        let datetime = py.import("datetime")?;
+        let timedelta = datetime.getattr("timedelta")?;
+        let td_kwargs = PyDict::new(py);
+        td_kwargs.set_item("seconds", elapsed_secs)?;
+        let elapsed_td = timedelta.call((), Some(&td_kwargs))?;
+        r.setattr("elapsed", elapsed_td)?;
+
+        // Dispatch response hooks
+        let hooks_mod = py.import("snekwest.hooks")?;
+        let dispatch_hook = hooks_mod.getattr("dispatch_hook")?;
+        let r = dispatch_hook.call(("response", &hooks, &r), Some(&kwargs))?;
+
+        // Extract cookies from history
+        let cookies_mod = py.import("snekwest.cookies")?;
+        let extract_cookies = cookies_mod.getattr("extract_cookies_to_jar")?;
+        let session_cookies = slf.borrow().cookies.clone_ref(py);
+        let history = r.getattr("history")?;
+        if history.is_truthy()? {
+            let hist_list: Vec<Py<PyAny>> = history.extract()?;
+            for resp in &hist_list {
+                let resp_bound = resp.bind(py);
+                extract_cookies.call1((
+                    &session_cookies,
+                    resp_bound.getattr("request")?,
+                    resp_bound.getattr("raw")?,
+                ))?;
+            }
+        }
+        extract_cookies.call1((
+            &session_cookies,
+            &request,
+            r.getattr("raw")?,
+        ))?;
+
+        // Handle redirects - call resolve_redirects via Python self (which inherits the mixin)
+        if allow_redirects {
+            let gen = slf.call_method("resolve_redirects", (&r, &request), Some(&kwargs))?;
+            let builtins = py.import("builtins")?;
+            let history_list = builtins.getattr("list")?.call1((&gen,))?;
+            let history: Vec<Py<PyAny>> = history_list.extract()?;
+            if !history.is_empty() {
+                let mut full_history = vec![r.unbind()];
+                full_history.extend(history);
+                let final_resp = full_history.pop().unwrap();
+                let hist_list = pyo3::types::PyList::new(py, &full_history)?;
+                final_resp.setattr(py, "history", hist_list)?;
+
+                if !stream {
+                    let _ = final_resp.getattr(py, "content")?;
+                }
+                return Ok(final_resp);
+            }
+        } else {
+            // Set _next for non-redirect responses
+            let yield_kwargs = kwargs.copy()?;
+            yield_kwargs.set_item("yield_requests", true)?;
+            let gen = slf.call_method("resolve_redirects", (&r, &request), Some(&yield_kwargs))?;
+            let builtins = py.import("builtins")?;
+            let next_fn = builtins.getattr("next")?;
+            let result = next_fn.call1((&gen, py.None()))?;
+            if !result.is_none() {
+                r.setattr("_next", result)?;
+            }
+        }
+
+        if !stream {
+            let _ = r.getattr("content")?;
+        }
+        Ok(r.unbind())
+    }
 }
+
