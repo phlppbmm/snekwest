@@ -1611,3 +1611,146 @@ impl Session {
         Ok(r.unbind())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- reason_phrase tests --
+
+    #[test]
+    fn test_reason_phrase_common_codes() {
+        assert_eq!(reason_phrase(200), Some("OK".to_string()));
+        assert_eq!(reason_phrase(404), Some("Not Found".to_string()));
+        assert_eq!(reason_phrase(500), Some("Internal Server Error".to_string()));
+        assert_eq!(reason_phrase(301), Some("Moved Permanently".to_string()));
+        assert_eq!(reason_phrase(302), Some("Found".to_string()));
+    }
+
+    #[test]
+    fn test_reason_phrase_unknown_code() {
+        assert_eq!(reason_phrase(999), None);
+        assert_eq!(reason_phrase(0), None);
+        assert_eq!(reason_phrase(600), None);
+    }
+
+    #[test]
+    fn test_reason_phrase_all_redirect_codes() {
+        assert_eq!(reason_phrase(301), Some("Moved Permanently".to_string()));
+        assert_eq!(reason_phrase(302), Some("Found".to_string()));
+        assert_eq!(reason_phrase(303), Some("See Other".to_string()));
+        assert_eq!(reason_phrase(307), Some("Temporary Redirect".to_string()));
+        assert_eq!(reason_phrase(308), Some("Permanent Redirect".to_string()));
+    }
+
+    // -- is_redirect_status tests --
+
+    #[test]
+    fn test_is_redirect_status_true() {
+        assert!(is_redirect_status(301));
+        assert!(is_redirect_status(302));
+        assert!(is_redirect_status(303));
+        assert!(is_redirect_status(307));
+        assert!(is_redirect_status(308));
+    }
+
+    #[test]
+    fn test_is_redirect_status_false() {
+        assert!(!is_redirect_status(200));
+        assert!(!is_redirect_status(304)); // Not Modified is NOT a redirect
+        assert!(!is_redirect_status(400));
+        assert!(!is_redirect_status(404));
+        assert!(!is_redirect_status(500));
+        assert!(!is_redirect_status(0));
+    }
+
+    // -- should_strip_auth tests --
+
+    #[test]
+    fn test_strip_auth_same_host_same_scheme() {
+        // Same host, same scheme → don't strip
+        assert!(!should_strip_auth(
+            "http://example.com/a",
+            "http://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_different_host() {
+        // Different host → always strip
+        assert!(should_strip_auth(
+            "http://example.com/a",
+            "http://other.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_http_to_https_default_ports() {
+        // HTTP→HTTPS on default ports → safe upgrade, don't strip
+        assert!(!should_strip_auth(
+            "http://example.com/a",
+            "https://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_https_to_http() {
+        // HTTPS→HTTP downgrade → strip
+        assert!(should_strip_auth(
+            "https://example.com/a",
+            "http://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_port_change() {
+        // Same host, different port → strip
+        assert!(should_strip_auth(
+            "http://example.com:8080/a",
+            "http://example.com:9090/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_explicit_default_port_to_implicit() {
+        // http://host:80 → http://host (both are port 80) → don't strip
+        assert!(!should_strip_auth(
+            "http://example.com:80/a",
+            "http://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_explicit_non_default_port() {
+        // http://host:8080 → http://host (80 vs 8080) → strip
+        assert!(should_strip_auth(
+            "http://example.com:8080/a",
+            "http://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_invalid_url() {
+        // Invalid URLs → don't strip (parse fails, returns false)
+        assert!(!should_strip_auth("not a url", "http://example.com"));
+        assert!(!should_strip_auth("http://example.com", "not a url"));
+    }
+
+    #[test]
+    fn test_strip_auth_https_explicit_443_to_implicit() {
+        // https://host:443 → https://host (both are 443) → don't strip
+        assert!(!should_strip_auth(
+            "https://example.com:443/a",
+            "https://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_http_to_https_non_default_ports() {
+        // http://host:8080 → https://host:8443 → strip (scheme + port change)
+        assert!(should_strip_auth(
+            "http://example.com:8080/a",
+            "https://example.com:8443/b"
+        ));
+    }
+}
