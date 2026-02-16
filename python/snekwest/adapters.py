@@ -190,22 +190,16 @@ class HTTPAdapter(BaseAdapter):
                     f"Could not find the TLS key file, invalid path: {key_file}"
                 )
 
-    def build_response(self, req, rust_response):
-        """Builds a :class:`Response <Response>` from a Rust response.
+    def build_response(self, req, resp):
+        """Attach request and connection to a Response from Rust.
 
         :param req: The :class:`PreparedRequest <PreparedRequest>` used to generate the response.
-        :param rust_response: The Rust response object.
+        :param resp: The Response object returned by the Rust session.
         :rtype: Response
         """
-        response = Response._from_rust(rust_response)
-
-        # Override request with our PreparedRequest
-        response.request = req
-        response.connection = self
-
-        # Re-extract cookies from rust response into the Response's cookie jar
-        # (already done in _from_rust, but ensure req linkage)
-        return response
+        resp.request = req
+        resp.connection = self
+        return resp
 
     def request_url(self, request, proxies):
         """Obtain the url to use when making the final request.
@@ -394,7 +388,7 @@ class HTTPAdapter(BaseAdapter):
             has_forcelist = (
                 hasattr(retries, "status_forcelist")
                 and retries.status_forcelist
-                and rust_response.status in retries.status_forcelist
+                and rust_response.status_code in retries.status_forcelist
             )
             if has_forcelist:
                 try:
@@ -410,14 +404,21 @@ class HTTPAdapter(BaseAdapter):
         resp = self.build_response(request, rust_response)
 
         if stream:
-            # Streaming: body available through raw, not yet "consumed"
-            resp._content_consumed = False
-            # Reset _content so it's lazily loaded on first .content access
-            resp._content = False
+            if not resp._content_consumed:
+                # Chunked streaming: _from_rust already set up StreamingRawResponse
+                # with _content=False, _content_consumed=False — nothing to do.
+                pass
+            else:
+                # Non-chunked streaming (has Content-Length): body was eagerly
+                # loaded by _from_rust.  Reset so iter_content reads from raw.
+                resp._content_consumed = False
+                resp._content = False
+                if resp.raw and hasattr(resp.raw, "seek"):
+                    resp.raw.seek(0)
         else:
             # Non-streaming: body already in _content, mark raw as exhausted
             # so raw.read() returns b"" (matching urllib3 behavior)
-            if resp.raw:
+            if resp.raw and hasattr(resp.raw, "seek"):
                 resp.raw.seek(0, 2)
 
         return resp

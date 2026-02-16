@@ -1,197 +1,270 @@
-"""Session management for snekwest, providing persistent connections and cookies."""
+"""
+snekwest.sessions
+~~~~~~~~~~~~~~~~~
 
-from typing import Any, Optional, Union
-from urllib.parse import urlencode
+This module provides a Session object to manage and persist settings across
+requests (cookies, auth, proxies).
+"""
+import os
+import sys
+import time
+from collections import OrderedDict
+from datetime import timedelta
 
-from snekwest._bindings import Response as RustResponse  # pylint: disable=no-name-in-module
-from snekwest._bindings import Session as RustSession  # pylint: disable=no-name-in-module
+from ._bindings import Session as _RustSession
+from ._internal_utils import to_native_string
+from .adapters import HTTPAdapter
+from .auth import _basic_auth_str
+from .compat import Mapping, cookielib, urljoin, urlparse
+from .cookies import (
+    RequestsCookieJar,
+    cookiejar_from_dict,
+    extract_cookies_to_jar,
+    merge_cookies,
+)
+from .exceptions import (
+    ChunkedEncodingError,
+    ContentDecodingError,
+    InvalidSchema,
+    TooManyRedirects,
+)
+from .hooks import default_hooks, dispatch_hook
 
-from .models import Response
+# formerly defined here, reexposed here for backward compatibility
+from .models import (  # noqa: F401
+    DEFAULT_REDIRECT_LIMIT,
+    REDIRECT_STATI,
+    PreparedRequest,
+    Request,
+)
+from .status_codes import codes
+from .structures import CaseInsensitiveDict
+from .utils import (  # noqa: F401
+    DEFAULT_PORTS,
+    default_headers,
+    get_auth_from_url,
+    get_environ_proxies,
+    get_netrc_auth,
+    requote_uri,
+    resolve_proxies,
+    rewind_body,
+    should_bypass_proxies,
+    to_key_val_list,
+)
 
-
-class _CookieProxy:
-    """Dict-like proxy for session cookies stored in Rust."""
-
-    def __init__(self, rust_session: RustSession) -> None:
-        self._rust_session = rust_session
-
-    def __getitem__(self, key: str) -> str:
-        cookies = self._rust_session.get_cookies()
-        return cookies[key]
-
-    def __setitem__(self, key: str, value: str) -> None:
-        self._rust_session.set_cookie(key, value)
-
-    def __delitem__(self, key: str) -> None:
-        self._rust_session.remove_cookie(key)
-
-    def __contains__(self, key: object) -> bool:
-        cookies = self._rust_session.get_cookies()
-        return key in cookies
-
-    def __bool__(self) -> bool:
-        return bool(self._rust_session.get_cookies())
-
-    def __len__(self) -> int:
-        return len(self._rust_session.get_cookies())
-
-    def __iter__(self):
-        return iter(self._rust_session.get_cookies())
-
-    def __repr__(self) -> str:
-        return repr(self._rust_session.get_cookies())
-
-    def get(self, key: str, default=None):
-        """Return the cookie value for key, or default."""
-        cookies = self._rust_session.get_cookies()
-        return cookies.get(key, default)
-
-    def items(self):
-        """Return cookie (name, value) pairs."""
-        return self._rust_session.get_cookies().items()
-
-    def keys(self):
-        """Return cookie names."""
-        return self._rust_session.get_cookies().keys()
-
-    def values(self):
-        """Return cookie values."""
-        return self._rust_session.get_cookies().values()
-
-    def update(self, other=None, **kwargs):
-        """Update cookies from a mapping or keyword arguments."""
-        if other:
-            self._rust_session.set_cookies(dict(other))
-        if kwargs:
-            self._rust_session.set_cookies(kwargs)
+if sys.platform == "win32":
+    preferred_clock = time.perf_counter
+else:
+    preferred_clock = time.time
 
 
-class Session:
-    """A requests-compatible HTTP session with persistent cookies and defaults."""
+def merge_setting(request_setting, session_setting, dict_class=OrderedDict):
+    """Determines appropriate setting for a given request, taking into account
+    the explicit setting on that request, and the setting in the session. If a
+    setting is a dictionary, they will be merged together using `dict_class`
+    """
+    if session_setting is None:
+        return request_setting
+    if request_setting is None:
+        return session_setting
+    if not (
+        isinstance(session_setting, Mapping) and isinstance(request_setting, Mapping)
+    ):
+        return request_setting
+    merged_setting = dict_class(to_key_val_list(session_setting))
+    merged_setting.update(to_key_val_list(request_setting))
+    none_keys = [k for (k, v) in merged_setting.items() if v is None]
+    for key in none_keys:
+        del merged_setting[key]
+    return merged_setting
 
-    def __init__(self) -> None:
-        self._rust_session = RustSession()
-        self.cookies = _CookieProxy(self._rust_session)
-        self.headers: dict[str, str] = {}
-        self.auth: Optional[tuple[str, str]] = None
-        self.params: dict[str, str] = {}
-        self.max_redirects: int = 30
 
-    def __enter__(self) -> "Session":
-        return self
+def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
+    """Properly merges both requests and session hooks."""
+    if session_hooks is None or session_hooks.get("response") == []:
+        return request_hooks
+    if request_hooks is None or request_hooks.get("response") == []:
+        return session_hooks
+    return merge_setting(request_hooks, session_hooks, dict_class)
 
-    def __exit__(self, *args) -> None:
-        self.close()
 
-    def close(self) -> None:
-        """Close the session and release resources."""
-        self._rust_session.close()
+class SessionRedirectMixin:
+    def get_redirect_target(self, resp):
+        """Receives a Response. Returns a redirect URI or ``None``"""
+        if resp.is_redirect:
+            location = resp.headers["location"]
+            location = location.encode("latin1")
+            return to_native_string(location, "utf8")
+        return None
 
-    def _sync_session_defaults(self) -> None:
-        """Push Python-side defaults into the Rust session."""
-        self._rust_session.default_headers = self.headers if self.headers else None
-        self._rust_session.default_auth = self.auth
-        self._rust_session.default_params = self.params if self.params else None
-        self._rust_session.max_redirects = self.max_redirects
+    def should_strip_auth(self, old_url, new_url):
+        """Decide whether Authorization header should be removed when redirecting"""
+        old_parsed = urlparse(old_url)
+        new_parsed = urlparse(new_url)
+        if old_parsed.hostname != new_parsed.hostname:
+            return True
+        if (
+            old_parsed.scheme == "http"
+            and old_parsed.port in (80, None)
+            and new_parsed.scheme == "https"
+            and new_parsed.port in (443, None)
+        ):
+            return False
+        changed_port = old_parsed.port != new_parsed.port
+        changed_scheme = old_parsed.scheme != new_parsed.scheme
+        default_port = (DEFAULT_PORTS.get(old_parsed.scheme, None), None)
+        if (
+            not changed_scheme
+            and old_parsed.port in default_port
+            and new_parsed.port in default_port
+        ):
+            return False
+        return changed_port or changed_scheme
 
-    def request(  # pylint: disable=too-many-arguments,too-many-locals  # requests-compatible API
-        self,
-        method: str,
-        url: str,
-        *,
-        params=None,
-        data=None,
-        headers=None,
-        cookies=None,
-        files=None,
-        auth=None,
-        timeout: Optional[Union[float, tuple]] = None,
-        allow_redirects: bool = True,
-        proxies=None,
-        hooks=None,
-        stream: Optional[bool] = None,
-        verify: Optional[bool] = None,
-        cert: Optional[Union[str, tuple[str, str]]] = None,
-        json: Optional[Any] = None,
-    ) -> Response:
-        """Send an HTTP request with the given method and URL."""
-        _ = hooks
-
-        # Handle bytes method (e.g. b"GET")
-        if isinstance(method, bytes):
-            method = method.decode("utf-8")
-
-        # Expand list/tuple params values into repeated keys
-        # e.g. {"test": ["foo", "baz"]} -> {"test": "foo", "test": "baz"}
-        # Since HashMap can't hold duplicates, we encode them into the URL
-        if params is not None and isinstance(params, dict):
-            has_list = any(isinstance(v, (list, tuple)) for v in params.values())
-            if has_list:
-                # Build query string with repeated keys
-                parts = []
-                for k, v in params.items():
-                    if isinstance(v, (list, tuple)):
-                        for item in v:
-                            parts.append((str(k), str(item)))
-                    else:
-                        parts.append((str(k), str(v)))
-                # Append to URL directly
-                separator = "&" if "?" in url else "?"
-                url = url + separator + urlencode(parts)
-                params = None
+    def resolve_redirects(
+        self, resp, req, stream=False, timeout=None, verify=True,
+        cert=None, proxies=None, yield_requests=False, **adapter_kwargs,
+    ):
+        """Receives a Response. Returns a generator of Responses or Requests."""
+        hist = []
+        url = self.get_redirect_target(resp)
+        previous_fragment = urlparse(req.url).fragment
+        while url:
+            prepared_request = req.copy()
+            hist.append(resp)
+            resp.history = hist[1:]
+            try:
+                resp.content
+            except (ChunkedEncodingError, ContentDecodingError, RuntimeError):
+                resp.raw.read(decode_content=False)
+            if len(resp.history) >= self.max_redirects:
+                raise TooManyRedirects(
+                    f"Exceeded {self.max_redirects} redirects.", response=resp
+                )
+            resp.close()
+            if url.startswith("//"):
+                parsed_rurl = urlparse(resp.url)
+                url = ":".join([to_native_string(parsed_rurl.scheme), url])
+            parsed = urlparse(url)
+            if parsed.fragment == "" and previous_fragment:
+                parsed = parsed._replace(fragment=previous_fragment)
+            elif parsed.fragment:
+                previous_fragment = parsed.fragment
+            url = parsed.geturl()
+            if not parsed.netloc:
+                url = urljoin(resp.url, requote_uri(url))
             else:
-                params = {str(k): str(v) for k, v in params.items()}
+                url = requote_uri(url)
+            prepared_request.url = to_native_string(url)
+            self.rebuild_method(prepared_request, resp)
+            if resp.status_code not in (
+                codes.temporary_redirect, codes.permanent_redirect,
+            ):
+                purged_headers = ("Content-Length", "Content-Type", "Transfer-Encoding")
+                for header in purged_headers:
+                    prepared_request.headers.pop(header, None)
+                prepared_request.body = None
+            headers = prepared_request.headers
+            headers.pop("Cookie", None)
+            extract_cookies_to_jar(prepared_request._cookies, req, resp.raw)
+            merge_cookies(prepared_request._cookies, self.cookies)
+            prepared_request.prepare_cookies(prepared_request._cookies)
+            proxies = self.rebuild_proxies(prepared_request, proxies)
+            self.rebuild_auth(prepared_request, resp)
+            rewindable = prepared_request._body_position is not None and (
+                "Content-Length" in headers or "Transfer-Encoding" in headers
+            )
+            if rewindable:
+                rewind_body(prepared_request)
+            req = prepared_request
+            if yield_requests:
+                yield req
+            else:
+                resp = self.send(
+                    req, stream=stream, timeout=timeout, verify=verify,
+                    cert=cert, proxies=proxies, allow_redirects=False,
+                    **adapter_kwargs,
+                )
+                extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
+                url = self.get_redirect_target(resp)
+                yield resp
 
-        # Sync session-level defaults to Rust
-        self._sync_session_defaults()
+    def rebuild_auth(self, prepared_request, response):
+        """When being redirected we may want to strip authentication from the
+        request to avoid leaking credentials."""
+        headers = prepared_request.headers
+        url = prepared_request.url
+        if "Authorization" in headers and self.should_strip_auth(
+            response.request.url, url
+        ):
+            del headers["Authorization"]
+        new_auth = get_netrc_auth(url) if self.trust_env else None
+        if new_auth is not None:
+            prepared_request.prepare_auth(new_auth)
 
-        rust_response: RustResponse = self._rust_session.make_request(
-            method=method,
-            url=url,
-            params=params,
-            data=data,
-            headers=headers,
-            cookies=cookies,
-            files=files,
-            auth=auth,
-            timeout=timeout,
-            allow_redirects=allow_redirects,
-            proxies=proxies,
-            stream=stream,
-            verify=verify,
-            cert=cert,
-            json=json,
-        )
+    def rebuild_proxies(self, prepared_request, proxies):
+        """This method re-evaluates the proxy configuration by considering the
+        environment variables."""
+        headers = prepared_request.headers
+        scheme = urlparse(prepared_request.url).scheme
+        new_proxies = resolve_proxies(prepared_request, proxies, self.trust_env)
+        if "Proxy-Authorization" in headers:
+            del headers["Proxy-Authorization"]
+        try:
+            username, password = get_auth_from_url(new_proxies[scheme])
+        except KeyError:
+            username, password = None, None
+        if not scheme.startswith("https") and username and password:
+            headers["Proxy-Authorization"] = _basic_auth_str(username, password)
+        return new_proxies
 
-        return Response(rust_response)
+    def rebuild_method(self, prepared_request, response):
+        """When being redirected we may want to change the method of the request
+        based on certain specs or browser behavior."""
+        method = prepared_request.method
+        if response.status_code == codes.see_other and method != "HEAD":
+            method = "GET"
+        if response.status_code == codes.found and method != "HEAD":
+            method = "GET"
+        if response.status_code == codes.moved and method == "POST":
+            method = "GET"
+        prepared_request.method = method
 
-    def get(self, url: str, **kwargs) -> Response:
-        """Send a GET request."""
-        kwargs.setdefault("allow_redirects", True)
-        return self.request("GET", url, **kwargs)
 
-    def options(self, url: str, **kwargs) -> Response:
-        """Send an OPTIONS request."""
-        kwargs.setdefault("allow_redirects", True)
-        return self.request("OPTIONS", url, **kwargs)
+class Session(SessionRedirectMixin, _RustSession):
+    """A Requests session.
 
-    def head(self, url: str, **kwargs) -> Response:
-        """Send a HEAD request."""
-        kwargs.setdefault("allow_redirects", False)
-        return self.request("HEAD", url, **kwargs)
+    Inherits from the Rust Session (transport, fields, core methods)
+    and SessionRedirectMixin (redirect handling).
+    """
 
-    def post(self, url: str, data=None, json=None, **kwargs) -> Response:
-        """Send a POST request."""
-        return self.request("POST", url, data=data, json=json, **kwargs)
+    __attrs__ = [
+        "headers", "cookies", "auth", "proxies", "hooks", "params",
+        "verify", "cert", "adapters", "stream", "trust_env", "max_redirects",
+    ]
 
-    def put(self, url: str, data=None, **kwargs) -> Response:
-        """Send a PUT request."""
-        return self.request("PUT", url, data=data, **kwargs)
+    def __init__(self):
+        super().__init__()
+        self.mount("https://", HTTPAdapter())
+        self.mount("http://", HTTPAdapter())
 
-    def patch(self, url: str, data=None, **kwargs) -> Response:
-        """Send a PATCH request."""
-        return self.request("PATCH", url, data=data, **kwargs)
+    def __getstate__(self):
+        state = {attr: getattr(self, attr, None) for attr in self.__attrs__}
+        return state
 
-    def delete(self, url: str, **kwargs) -> Response:
-        """Send a DELETE request."""
-        return self.request("DELETE", url, **kwargs)
+    def __setstate__(self, state):
+        for attr, value in state.items():
+            setattr(self, attr, value)
+
+
+def session():
+    """Returns a :class:`Session` for context-management.
+
+    .. deprecated:: 1.0.0
+        This method has been deprecated since version 1.0.0 and is only kept
+        for backwards compatibility. New code should use :class:`~requests.sessions.Session`
+        to create sessions.
+
+    :rtype: Session
+    """
+    return Session()

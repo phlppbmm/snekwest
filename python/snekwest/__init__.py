@@ -1,50 +1,40 @@
 """snekwest — a Rust-backed, requests-compatible HTTP client for Python."""
 
-from snekwest.api import delete, get, head, options, patch, post, put, request
-from snekwest.models import Response
-from snekwest.sessions import Session
-from snekwest.exceptions import (  # pylint: disable=redefined-builtin  # requests-compatible API
+import logging
+import warnings
+from logging import NullHandler
+
+from . import packages, utils  # noqa: F401
+from .__version__ import (
+    __author__,
+    __author_email__,
+    __build__,
+    __cake__,
+    __copyright__,
+    __description__,
+    __license__,
+    __title__,
+    __url__,
+    __version__,
+)
+from .api import delete, get, head, options, patch, post, put, request
+from .exceptions import (  # pylint: disable=redefined-builtin
     ConnectionError,
     ConnectTimeout,
     FileModeWarning,
     HTTPError,
-    InvalidSchema,
-    InvalidURL,
     JSONDecodeError,
-    MissingSchema,
-    ProxyError,
     ReadTimeout,
     RequestException,
-    SSLError,
     Timeout,
     TooManyRedirects,
     URLRequired,
 )
+from .models import PreparedRequest, Request, Response
+from .sessions import Session, session
+from .status_codes import codes
 
-__all__: tuple[str, ...] = (
-    "delete",
-    "get",
-    "head",
-    "options",
-    "patch",
-    "post",
-    "put",
-    "request",
-    "Response",
-    "Session",
-    "ConnectionError",
-    "ConnectTimeout",
-    "FileModeWarning",
-    "HTTPError",
-    "InvalidSchema",
-    "InvalidURL",
-    "JSONDecodeError",
-    "MissingSchema",
-    "ProxyError",
-    "ReadTimeout",
-    "RequestException",
-    "SSLError",
-    "Timeout",
-    "TooManyRedirects",
-    "URLRequired",
-)
+logging.getLogger(__name__).addHandler(NullHandler())
+
+# FileModeWarnings go off per the default.
+warnings.simplefilter("default", FileModeWarning, append=True)

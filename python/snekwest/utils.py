@@ -59,6 +59,25 @@ from .exceptions import (
 )
 from .structures import CaseInsensitiveDict
 
+# Import Rust-implemented utility functions
+from ._bindings import (  # noqa: F811, E402
+    is_ipv4_address,
+    is_valid_cidr,
+    dotted_netmask,
+    address_in_network,
+    get_auth_from_url,
+    unquote_unreserved,
+    requote_uri,
+    urldefragauth,
+    prepend_scheme_if_needed,
+    unicode_is_ascii,
+    parse_header_links,
+    get_encoding_from_headers,
+    _parse_content_type_header,
+    guess_json_utf,
+    select_proxy,
+)
+
 NETRC_FILES = (".netrc", "_netrc")
 
 DEFAULT_CA_BUNDLE_PATH = certs.where()
@@ -217,14 +236,7 @@ def get_netrc_auth(url, raise_errors=False):
         netrc_path = None
 
         for f in netrc_locations:
-            try:
-                loc = os.path.expanduser(f)
-            except KeyError:
-                # os.path.expanduser can fail when $HOME is undefined and
-                # getpwuid fails. See https://bugs.python.org/issue20164 &
-                # https://github.com/psf/requests/issues/1846
-                return
-
+            loc = os.path.expanduser(f)
             if os.path.exists(loc):
                 netrc_path = loc
                 break
@@ -234,17 +246,11 @@ def get_netrc_auth(url, raise_errors=False):
             return
 
         ri = urlparse(url)
-
-        # Strip port numbers from netloc. This weird `if...encode`` dance is
-        # used for Python 3.2, which doesn't support unicode literals.
-        splitstr = b":"
-        if isinstance(url, str):
-            splitstr = splitstr.decode("ascii")
-        host = ri.netloc.split(splitstr)[0]
+        host = ri.hostname
 
         try:
             _netrc = netrc(netrc_path).authenticators(host)
-            if _netrc:
+            if _netrc and any(_netrc):
                 # Return with login / password
                 login_i = 0 if _netrc[0] else 1
                 return (_netrc[login_i], _netrc[2])
@@ -510,54 +516,8 @@ def get_encodings_from_content(content):
     )
 
 
-def _parse_content_type_header(header):
-    """Returns content type and parameters from given header
-
-    :param header: string
-    :return: tuple containing content type and dictionary of
-         parameters
-    """
-
-    tokens = header.split(";")
-    content_type, params = tokens[0].strip(), tokens[1:]
-    params_dict = {}
-    items_to_strip = "\"' "
-
-    for param in params:
-        param = param.strip()
-        if param:
-            key, value = param, True
-            index_of_equals = param.find("=")
-            if index_of_equals != -1:
-                key = param[:index_of_equals].strip(items_to_strip)
-                value = param[index_of_equals + 1 :].strip(items_to_strip)
-            params_dict[key.lower()] = value
-    return content_type, params_dict
-
-
-def get_encoding_from_headers(headers):
-    """Returns encodings from given HTTP Header Dict.
-
-    :param headers: dictionary to extract encoding from.
-    :rtype: str
-    """
-
-    content_type = headers.get("content-type")
-
-    if not content_type:
-        return None
-
-    content_type, params = _parse_content_type_header(content_type)
-
-    if "charset" in params:
-        return params["charset"].strip("'\"")
-
-    if "text" in content_type:
-        return "ISO-8859-1"
-
-    if "application/json" in content_type:
-        # Assume UTF-8 based on RFC 4627: https://www.ietf.org/rfc/rfc4627.txt since the charset was unset
-        return "utf-8"
+# _parse_content_type_header, get_encoding_from_headers
+# are now imported from Rust (_bindings) above.
 
 
 def stream_decode_response_unicode(iterator, r):
@@ -626,117 +586,14 @@ def get_unicode_from_response(r):
         return r.content
 
 
-# The unreserved URI characters (RFC 3986)
-UNRESERVED_SET = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" + "0123456789-._~"
-)
+# UNRESERVED_SET moved to Rust
 
 
-def unquote_unreserved(uri):
-    """Un-escape any percent-escape sequences in a URI that are unreserved
-    characters. This leaves all reserved, illegal and non-ASCII bytes encoded.
-
-    :rtype: str
-    """
-    parts = uri.split("%")
-    for i in range(1, len(parts)):
-        h = parts[i][0:2]
-        if len(h) == 2 and h.isalnum():
-            try:
-                c = chr(int(h, 16))
-            except ValueError:
-                raise InvalidURL(f"Invalid percent-escape sequence: '{h}'")
-
-            if c in UNRESERVED_SET:
-                parts[i] = c + parts[i][2:]
-            else:
-                parts[i] = f"%{parts[i]}"
-        else:
-            parts[i] = f"%{parts[i]}"
-    return "".join(parts)
+# unquote_unreserved, requote_uri are now imported from Rust (_bindings) above.
 
 
-def requote_uri(uri):
-    """Re-quote the given URI.
-
-    This function passes the given URI through an unquote/quote cycle to
-    ensure that it is fully and consistently quoted.
-
-    :rtype: str
-    """
-    safe_with_percent = "!#$%&'()*+,/:;=?@[]~"
-    safe_without_percent = "!#$&'()*+,/:;=?@[]~"
-    try:
-        # Unquote only the unreserved characters
-        # Then quote only illegal characters (do not quote reserved,
-        # unreserved, or '%')
-        return quote(unquote_unreserved(uri), safe=safe_with_percent)
-    except InvalidURL:
-        # We couldn't unquote the given URI, so let's try quoting it, but
-        # there may be unquoted '%'s in the URI. We need to make sure they're
-        # properly quoted so they do not cause issues elsewhere.
-        return quote(uri, safe=safe_without_percent)
-
-
-def address_in_network(ip, net):
-    """This function allows you to check if an IP belongs to a network subnet
-
-    Example: returns True if ip = 192.168.1.1 and net = 192.168.1.0/24
-             returns False if ip = 192.168.1.1 and net = 192.168.100.0/24
-
-    :rtype: bool
-    """
-    ipaddr = struct.unpack("=L", socket.inet_aton(ip))[0]
-    netaddr, bits = net.split("/")
-    netmask = struct.unpack("=L", socket.inet_aton(dotted_netmask(int(bits))))[0]
-    network = struct.unpack("=L", socket.inet_aton(netaddr))[0] & netmask
-    return (ipaddr & netmask) == (network & netmask)
-
-
-def dotted_netmask(mask):
-    """Converts mask from /xx format to xxx.xxx.xxx.xxx
-
-    Example: if mask is 24 function returns 255.255.255.0
-
-    :rtype: str
-    """
-    bits = 0xFFFFFFFF ^ (1 << 32 - mask) - 1
-    return socket.inet_ntoa(struct.pack(">I", bits))
-
-
-def is_ipv4_address(string_ip):
-    """
-    :rtype: bool
-    """
-    try:
-        socket.inet_aton(string_ip)
-    except OSError:
-        return False
-    return True
-
-
-def is_valid_cidr(string_network):
-    """
-    Very simple check of the cidr format in no_proxy variable.
-
-    :rtype: bool
-    """
-    if string_network.count("/") == 1:
-        try:
-            mask = int(string_network.split("/")[1])
-        except ValueError:
-            return False
-
-        if mask < 1 or mask > 32:
-            return False
-
-        try:
-            socket.inet_aton(string_network.split("/")[0])
-        except OSError:
-            return False
-    else:
-        return False
-    return True
+# address_in_network, dotted_netmask, is_ipv4_address, is_valid_cidr
+# are now imported from Rust (_bindings) above.
 
 
 @contextlib.contextmanager
@@ -910,79 +767,10 @@ def default_headers():
     )
 
 
-def parse_header_links(value):
-    """Return a list of parsed link headers proxies.
-
-    i.e. Link: <http:/.../front.jpeg>; rel=front; type="image/jpeg",<http://.../back.jpeg>; rel=back;type="image/jpeg"
-
-    :rtype: list
-    """
-
-    links = []
-
-    replace_chars = " '\""
-
-    value = value.strip(replace_chars)
-    if not value:
-        return links
-
-    for val in re.split(", *<", value):
-        try:
-            url, params = val.split(";", 1)
-        except ValueError:
-            url, params = val, ""
-
-        link = {"url": url.strip("<> '\"")}
-
-        for param in params.split(";"):
-            try:
-                key, value = param.split("=")
-            except ValueError:
-                break
-
-            link[key.strip(replace_chars)] = value.strip(replace_chars)
-
-        links.append(link)
-
-    return links
+# parse_header_links is now imported from Rust (_bindings) above.
 
 
-# Null bytes; no need to recreate these on each call to guess_json_utf
-_null = "\x00".encode("ascii")  # encoding to ASCII for Python 3
-_null2 = _null * 2
-_null3 = _null * 3
-
-
-def guess_json_utf(data):
-    """
-    :rtype: str
-    """
-    # JSON always starts with two ASCII characters, so detection is as
-    # easy as counting the nulls and from their location and count
-    # determine the encoding. Also detect a BOM, if present.
-    sample = data[:4]
-    if sample in (codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE):
-        return "utf-32"  # BOM included
-    if sample[:3] == codecs.BOM_UTF8:
-        return "utf-8-sig"  # BOM included, MS style (discouraged)
-    if sample[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
-        return "utf-16"  # BOM included
-    nullcount = sample.count(_null)
-    if nullcount == 0:
-        return "utf-8"
-    if nullcount == 2:
-        if sample[::2] == _null2:  # 1st and 3rd are null
-            return "utf-16-be"
-        if sample[1::2] == _null2:  # 2nd and 4th are null
-            return "utf-16-le"
-        # Did not detect 2 valid UTF-16 ascii-range characters
-    if nullcount == 3:
-        if sample[:3] == _null3:
-            return "utf-32-be"
-        if sample[1:] == _null3:
-            return "utf-32-le"
-        # Did not detect a valid UTF-32 ascii-range character
-    return None
+# guess_json_utf is now imported from Rust (_bindings) above.
 
 
 def prepend_scheme_if_needed(url, new_scheme):
@@ -991,18 +779,19 @@ def prepend_scheme_if_needed(url, new_scheme):
 
     :rtype: str
     """
-    # Inline replacement for urllib3.util.parse_url
-    parsed = _stdlib_urlparse(url)
-    scheme = parsed.scheme or None
-    netloc = parsed.netloc or None
-    path = parsed.path or None
-    query = parsed.query or None
-    fragment = parsed.fragment or None
+    from urllib3.util.url import parse_url
 
-    # If no netloc, swap netloc and path (matching urllib3 parse_url behavior)
+    parsed = parse_url(url)
+    scheme, auth, host, port, path, query, fragment = parsed
+
+    netloc = parsed.netloc
     if not netloc:
         netloc, path = path, netloc
 
+    if auth:
+        # parse_url doesn't provide the netloc with auth
+        # so we'll add it ourselves.
+        netloc = "@".join([auth, netloc])
     if scheme is None:
         scheme = new_scheme
     if path is None:
@@ -1011,20 +800,7 @@ def prepend_scheme_if_needed(url, new_scheme):
     return _stdlib_urlunparse((scheme, netloc or "", path, "", query or "", fragment or ""))
 
 
-def get_auth_from_url(url):
-    """Given a url with authentication components, extract them into a tuple of
-    username,password.
-
-    :rtype: (str,str)
-    """
-    parsed = urlparse(url)
-
-    try:
-        auth = (unquote(parsed.username), unquote(parsed.password))
-    except (AttributeError, TypeError):
-        auth = ("", "")
-
-    return auth
+# get_auth_from_url is now imported from Rust (_bindings) above.
 
 
 def check_header_validity(header):
