@@ -5,6 +5,7 @@ snekwest._internal_utils
 Provides utility functions that are consumed internally by snekwest
 which depend on extremely few external helpers (such as compat)
 """
+
 import re
 
 
@@ -22,4 +23,4 @@ HEADER_VALIDATORS = {
 
 
 # Re-export from Rust for backwards compatibility (conftest module swap needs this)
-from ._bindings import unicode_is_ascii, to_native_string  # noqa: F401
+from ._bindings import unicode_is_ascii, to_native_string  # noqa: E402, F401

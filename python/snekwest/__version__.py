@@ -1,5 +1,7 @@
 __title__ = "snekwest"
-__description__ = "A blazingly fast, memory-safe HTTP client for Python, powered by Rust's reqwest."
+__description__ = (
+    "A blazingly fast, memory-safe HTTP client for Python, powered by Rust's reqwest."
+)
 __url__ = "https://github.com/oakstation/snekwest"
 __version__ = "0.3.3"
 __build__ = 0x000303

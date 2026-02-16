@@ -5,7 +5,7 @@ import warnings
 from logging import NullHandler
 
 from . import packages, utils  # noqa: F401
-from .__version__ import (
+from .__version__ import (  # noqa: F401
     __author__,
     __author_email__,
     __build__,
@@ -17,8 +17,8 @@ from .__version__ import (
     __url__,
     __version__,
 )
-from .api import delete, get, head, options, patch, post, put, request
-from .exceptions import (  # pylint: disable=redefined-builtin
+from .api import delete, get, head, options, patch, post, put, request  # noqa: F401
+from .exceptions import (  # noqa: F401  # pylint: disable=redefined-builtin
     ConnectionError,
     ConnectTimeout,
     FileModeWarning,
@@ -30,9 +30,9 @@ from .exceptions import (  # pylint: disable=redefined-builtin
     TooManyRedirects,
     URLRequired,
 )
-from .models import PreparedRequest, Request, Response
-from .sessions import Session, session
-from .status_codes import codes
+from .models import PreparedRequest, Request, Response  # noqa: F401
+from .sessions import Session, session  # noqa: F401
+from .status_codes import codes  # noqa: F401
 
 logging.getLogger(__name__).addHandler(NullHandler())
 

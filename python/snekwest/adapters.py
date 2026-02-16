@@ -8,12 +8,11 @@ and maintain connections. Bridges to the Rust reqwest backend.
 
 import os.path
 import socket  # noqa: F401
-import typing
 
-from .auth import _basic_auth_str
-from .compat import basestring, urlparse
-from .cookies import extract_cookies_to_jar
-from .exceptions import (
+from .auth import _basic_auth_str  # noqa: F401
+from .compat import basestring, urlparse  # noqa: F401
+from .cookies import extract_cookies_to_jar  # noqa: F401
+from .exceptions import (  # noqa: F401
     ConnectionError,
     ConnectTimeout,
     InvalidHeader,
@@ -25,9 +24,9 @@ from .exceptions import (
     RetryError,
     SSLError,
 )
-from .models import Response
-from .structures import CaseInsensitiveDict
-from .utils import (
+from .models import Response  # noqa: F401
+from .structures import CaseInsensitiveDict  # noqa: F401
+from .utils import (  # noqa: F401
     DEFAULT_CA_BUNDLE_PATH,
     extract_zipped_paths,
     get_auth_from_url,
@@ -36,10 +35,6 @@ from .utils import (
     select_proxy,
     urldefragauth,
 )
-
-if typing.TYPE_CHECKING:
-    from .models import PreparedRequest
-
 
 DEFAULT_POOLBLOCK = False
 DEFAULT_POOLSIZE = 10
@@ -92,6 +87,7 @@ class HTTPAdapter(BaseAdapter):
     ):
         if isinstance(max_retries, int):
             from urllib3.util.retry import Retry
+
             self.max_retries = Retry(max_retries, respect_retry_after_header=False)
         else:
             self.max_retries = max_retries
@@ -113,6 +109,7 @@ class HTTPAdapter(BaseAdapter):
         """Get or create the Rust session used for transport."""
         if self._rust_session is None:
             from snekwest._bindings import Session as RustSession
+
             self._rust_session = RustSession()
         return self._rust_session
 
@@ -353,6 +350,7 @@ class HTTPAdapter(BaseAdapter):
         # Convert urllib3 Timeout objects to float/tuple for Rust
         try:
             from urllib3.util import Timeout as Urllib3Timeout
+
             if isinstance(timeout, Urllib3Timeout):
                 if timeout.total is not None:
                     timeout = timeout.total
@@ -369,6 +367,7 @@ class HTTPAdapter(BaseAdapter):
         # Call Rust session - single hop, no redirects
         # Implement retry logic for status_forcelist
         from urllib3.exceptions import MaxRetryError
+
         retries = self.max_retries
         while True:
             rust_response = rust_session.make_request(
@@ -393,7 +392,9 @@ class HTTPAdapter(BaseAdapter):
             if has_forcelist:
                 try:
                     retries = retries.increment(
-                        method=method, url=url, response=None,
+                        method=method,
+                        url=url,
+                        response=None,
                     )
                 except MaxRetryError as e:
                     raise RetryError(e, request=request)

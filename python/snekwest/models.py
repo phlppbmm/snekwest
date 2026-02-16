@@ -5,15 +5,15 @@ snekwest.models
 This module contains the primary objects that power snekwest.
 """
 
-import datetime
+import datetime  # noqa: F401
 import encodings.idna  # noqa: F401
-from io import BytesIO, UnsupportedOperation
-from urllib.parse import urlparse as _urlparse, urlsplit as _urlsplit
+from io import BytesIO, UnsupportedOperation  # noqa: F401
+from urllib.parse import urlparse as _urlparse
 
-from ._internal_utils import to_native_string
-from .utils import unicode_is_ascii
-from .auth import HTTPBasicAuth
-from .compat import (
+from ._internal_utils import to_native_string  # noqa: F401
+from .utils import unicode_is_ascii  # noqa: F401
+from .auth import HTTPBasicAuth  # noqa: F401
+from .compat import (  # noqa: F401
     Callable,
     JSONDecodeError,
     Mapping,
@@ -22,10 +22,10 @@ from .compat import (
     chardet,
     cookielib,
 )
-from .compat import json as complexjson
-from .compat import urlencode, urlsplit, urlunparse
-from .cookies import _copy_cookie_jar, cookiejar_from_dict, get_cookie_header
-from .exceptions import (
+from .compat import json as complexjson  # noqa: F401
+from .compat import urlencode, urlsplit, urlunparse  # noqa: F401
+from .cookies import _copy_cookie_jar, cookiejar_from_dict, get_cookie_header  # noqa: F401
+from .exceptions import (  # noqa: F401
     ChunkedEncodingError,
     ContentDecodingError,
     HTTPError,
@@ -34,9 +34,9 @@ from .exceptions import (
     MissingSchema,
     StreamConsumedError,
 )
-from .exceptions import JSONDecodeError as RequestsJSONDecodeError
-from .exceptions import SSLError as RequestsSSLError
-from .hooks import default_hooks
+from .exceptions import JSONDecodeError as RequestsJSONDecodeError  # noqa: F401
+from .exceptions import SSLError as RequestsSSLError  # noqa: F401
+from .hooks import default_hooks  # noqa: F401
 
 try:
     from urllib3.exceptions import (
@@ -47,9 +47,9 @@ try:
     )
 except ImportError:
     _DecodeError = _ProtocolError = _ReadTimeoutError = _SSLError = Exception
-from .status_codes import codes
-from .structures import CaseInsensitiveDict
-from .utils import (
+from .status_codes import codes  # noqa: F401
+from .structures import CaseInsensitiveDict  # noqa: F401
+from .utils import (  # noqa: F401
     check_header_validity,
     get_auth_from_url,
     guess_filename,
@@ -127,14 +127,24 @@ def _parse_url(url):
             self.netloc = netloc
 
         def __iter__(self):
-            return iter([self.scheme, self.auth, self.host, self.port,
-                         self.path, self.query, self.fragment])
+            return iter(
+                [
+                    self.scheme,
+                    self.auth,
+                    self.host,
+                    self.port,
+                    self.path,
+                    self.query,
+                    self.fragment,
+                ]
+            )
 
     return ParseResult(scheme, auth, host, port, path, query, fragment)
 
 
 class _FakeOriginalResponse:
     """Minimal shim for extract_cookies_to_jar, which needs resp.raw._original_response.msg."""
+
     def __init__(self, msg):
         self.msg = msg
 
@@ -185,9 +195,7 @@ def _encode_files(files, data):
                     v = str(v)
                 new_fields.append(
                     (
-                        field.decode("utf-8")
-                        if isinstance(field, bytes)
-                        else field,
+                        field.decode("utf-8") if isinstance(field, bytes) else field,
                         v.encode("utf-8") if isinstance(v, str) else v,
                     )
                 )
@@ -226,6 +234,7 @@ def _encode_files(files, data):
         except ImportError:
             # Fallback: build multipart manually
             import uuid
+
             boundary = uuid.uuid4().hex
             body = b""
             for field_name, field_val in new_fields:
@@ -247,6 +256,7 @@ def _encode_files(files, data):
 
     try:
         from urllib3.filepost import encode_multipart_formdata
+
         body, content_type = encode_multipart_formdata(new_fields)
     except ImportError:
         raise NotImplementedError("urllib3 is required for multipart file uploads")
@@ -254,7 +264,7 @@ def _encode_files(files, data):
 
 
 # Import Rust PreparedRequest and Response
-from ._bindings import PreparedRequest, Response  # noqa: E402
+from ._bindings import PreparedRequest, Response  # noqa: E402, F401
 
 
 class Request:
@@ -335,5 +345,3 @@ class Request:
             return True
         except ValueError:
             return False
-
-

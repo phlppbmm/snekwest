@@ -47,24 +47,24 @@ try:
 
     has_simplejson = True
 except ImportError:
-    import json
+    import json  # noqa: F401
 
 if has_simplejson:
-    from simplejson import JSONDecodeError
+    from simplejson import JSONDecodeError  # noqa: F401
 else:
-    from json import JSONDecodeError
+    from json import JSONDecodeError  # noqa: F401
 
 # Keep OrderedDict for backwards compatibility.
-from collections import OrderedDict
-from collections.abc import Callable, Mapping, MutableMapping
-from http import cookiejar as cookielib
-from http.cookies import Morsel
-from io import StringIO
+from collections import OrderedDict  # noqa: E402, F401
+from collections.abc import Callable, Mapping, MutableMapping  # noqa: E402, F401
+from http import cookiejar as cookielib  # noqa: E402, F401
+from http.cookies import Morsel  # noqa: E402, F401
+from io import StringIO  # noqa: E402, F401
 
 # --------------
 # Legacy Imports
 # --------------
-from urllib.parse import (
+from urllib.parse import (  # noqa: E402, F401
     quote,
     quote_plus,
     unquote,
@@ -76,7 +76,7 @@ from urllib.parse import (
     urlsplit,
     urlunparse,
 )
-from urllib.request import (
+from urllib.request import (  # noqa: E402, F401
     getproxies,
     getproxies_environment,
     parse_http_list,

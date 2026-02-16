@@ -5,30 +5,31 @@ snekwest.sessions
 This module provides a Session object to manage and persist settings across
 requests (cookies, auth, proxies).
 """
-import os
+
+import os  # noqa: F401
 import sys
 import time
 from collections import OrderedDict
-from datetime import timedelta
+from datetime import timedelta  # noqa: F401
 
 from ._bindings import Session as _RustSession
 from ._internal_utils import to_native_string
 from .adapters import HTTPAdapter
 from .auth import _basic_auth_str
-from .compat import Mapping, cookielib, urljoin, urlparse
-from .cookies import (
+from .compat import Mapping, cookielib, urljoin, urlparse  # noqa: F401
+from .cookies import (  # noqa: F401
     RequestsCookieJar,
     cookiejar_from_dict,
     extract_cookies_to_jar,
     merge_cookies,
 )
-from .exceptions import (
+from .exceptions import (  # noqa: F401
     ChunkedEncodingError,
     ContentDecodingError,
     InvalidSchema,
     TooManyRedirects,
 )
-from .hooks import default_hooks, dispatch_hook
+from .hooks import default_hooks, dispatch_hook  # noqa: F401
 
 # formerly defined here, reexposed here for backward compatibility
 from .models import (  # noqa: F401
@@ -38,7 +39,7 @@ from .models import (  # noqa: F401
     Request,
 )
 from .status_codes import codes
-from .structures import CaseInsensitiveDict
+from .structures import CaseInsensitiveDict  # noqa: F401
 from .utils import (  # noqa: F401
     DEFAULT_PORTS,
     default_headers,
@@ -122,8 +123,16 @@ class SessionRedirectMixin:
         return changed_port or changed_scheme
 
     def resolve_redirects(
-        self, resp, req, stream=False, timeout=None, verify=True,
-        cert=None, proxies=None, yield_requests=False, **adapter_kwargs,
+        self,
+        resp,
+        req,
+        stream=False,
+        timeout=None,
+        verify=True,
+        cert=None,
+        proxies=None,
+        yield_requests=False,
+        **adapter_kwargs,
     ):
         """Receives a Response. Returns a generator of Responses or Requests."""
         hist = []
@@ -158,7 +167,8 @@ class SessionRedirectMixin:
             prepared_request.url = to_native_string(url)
             self.rebuild_method(prepared_request, resp)
             if resp.status_code not in (
-                codes.temporary_redirect, codes.permanent_redirect,
+                codes.temporary_redirect,
+                codes.permanent_redirect,
             ):
                 purged_headers = ("Content-Length", "Content-Type", "Transfer-Encoding")
                 for header in purged_headers:
@@ -181,8 +191,13 @@ class SessionRedirectMixin:
                 yield req
             else:
                 resp = self.send(
-                    req, stream=stream, timeout=timeout, verify=verify,
-                    cert=cert, proxies=proxies, allow_redirects=False,
+                    req,
+                    stream=stream,
+                    timeout=timeout,
+                    verify=verify,
+                    cert=cert,
+                    proxies=proxies,
+                    allow_redirects=False,
                     **adapter_kwargs,
                 )
                 extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
@@ -239,8 +254,18 @@ class Session(SessionRedirectMixin, _RustSession):
     """
 
     __attrs__ = [
-        "headers", "cookies", "auth", "proxies", "hooks", "params",
-        "verify", "cert", "adapters", "stream", "trust_env", "max_redirects",
+        "headers",
+        "cookies",
+        "auth",
+        "proxies",
+        "hooks",
+        "params",
+        "verify",
+        "cert",
+        "adapters",
+        "stream",
+        "trust_env",
+        "max_redirects",
     ]
 
     def __init__(self):

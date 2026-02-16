@@ -12,15 +12,11 @@ import io
 import os
 import re
 import socket
-import struct
 import sys
 import tempfile
 import warnings
 import zipfile
 from collections import OrderedDict
-from urllib.parse import urlparse as _stdlib_urlparse
-from urllib.parse import urlunparse as _stdlib_urlunparse
-
 from . import certs
 from .__version__ import __version__
 
@@ -39,7 +35,7 @@ from .compat import (
     integer_types,
     is_urllib3_1,
 )
-from .compat import (
+from .compat import (  # noqa: F401
     proxy_bypass,
     proxy_bypass_environment,
     quote,
@@ -48,7 +44,7 @@ from .compat import (
     urlunparse,
 )
 from .cookies import cookiejar_from_dict
-from .exceptions import (
+from .exceptions import (  # noqa: F401
     FileModeWarning,
     InvalidHeader,
     InvalidURL,
@@ -57,7 +53,7 @@ from .exceptions import (
 from .structures import CaseInsensitiveDict
 
 # Import Rust-implemented utility functions
-from ._bindings import (  # noqa: F811, E402
+from ._bindings import (  # noqa: F401, F811, E402
     is_ipv4_address,
     is_valid_cidr,
     dotted_netmask,
@@ -74,7 +70,6 @@ from ._bindings import (  # noqa: F811, E402
     guess_json_utf,
     select_proxy,
     check_header_validity,
-    to_native_string as _rust_to_native_string,
     parse_list_header,
     parse_dict_header,
     unquote_header_value,

@@ -6,7 +6,7 @@ Re-exports urllib3, idna, and chardet for compatibility with requests.
 Some code (including tests) does ``from requests.packages.urllib3 import ...``.
 """
 
-import urllib3
+import urllib3  # noqa: F401
 
 try:
     import idna
