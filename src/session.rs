@@ -469,7 +469,6 @@ fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
 pub struct Session {
     // Internal transport state (used by make_request/do_request chain)
     clients: Mutex<HashMap<ClientConfig, Arc<Client>>>,
-    cookie_jar: Mutex<HashMap<String, String>>,
     // Python-facing session attributes
     #[pyo3(get, set)]
     pub headers: Py<PyAny>,
@@ -511,17 +510,8 @@ impl Session {
         Ok(new_client)
     }
 
-    fn merge_cookies(&self, params: &RequestParams) -> HashMap<String, String> {
-        let mut all_cookies = {
-            let session_cookies = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
-            session_cookies.clone()
-        };
-
-        if let Some(request_cookies) = &params.cookies {
-            all_cookies.extend(request_cookies.clone());
-        }
-
-        all_cookies
+    fn merge_cookies(params: &RequestParams) -> HashMap<String, String> {
+        params.cookies.clone().unwrap_or_default()
     }
 
     fn build_request(
@@ -638,52 +628,6 @@ impl Session {
                 ))
             })
         })
-    }
-
-    fn update_session_cookies(
-        &self,
-        response: &reqwest::blocking::Response,
-        request_had_cookies: bool,
-    ) {
-        // Don't update session cookies if the request had per-request cookies
-        if request_had_cookies {
-            return;
-        }
-
-        let mut jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
-
-        for (name, value) in response.headers() {
-            if name.as_str().to_lowercase() == "set-cookie" {
-                if let Ok(cookie_str) = value.to_str() {
-                    self.parse_and_store_cookie(&mut jar, cookie_str);
-                }
-            }
-        }
-    }
-
-    fn parse_and_store_cookie(&self, jar: &mut HashMap<String, String>, cookie_str: &str) {
-        if let Some(cookie_pair) = cookie_str.split(';').next() {
-            if let Some((key, val)) = cookie_pair.split_once('=') {
-                let key = key.trim().to_string();
-                let val = val.trim().to_string();
-
-                // Check for expired cookies
-                let lower = cookie_str.to_lowercase();
-                if lower.contains("expires=") {
-                    // Check if it's an expiry in the past (epoch-ish)
-                    if lower.contains("1970") || lower.contains("deleted") {
-                        jar.remove(&key);
-                        return;
-                    }
-                }
-                if lower.contains("max-age=0") {
-                    jar.remove(&key);
-                    return;
-                }
-
-                jar.insert(key, val);
-            }
-        }
     }
 
     fn extract_response_headers(
@@ -856,14 +800,14 @@ impl Session {
 
         let original_method = params.method.clone();
         let request_url = params.url.clone();
-        let has_request_cookies = params.cookies.is_some();
-
         // Determine auth from request params
         let auth = params.auth.clone();
         let extra_headers: Option<HashMap<String, String>> = None;
 
-        // Build merged cookies for the first request
-        let merged_cookies = self.merge_cookies(&params);
+        // Build merged cookies for the first request (only per-request cookies;
+        // session-level cookies are managed by Python's RequestsCookieJar and
+        // arrive via PreparedRequest headers)
+        let merged_cookies = Self::merge_cookies(&params);
 
         // Collect request headers for the Request object on the final response
         // We'll capture them from the first redirect step
@@ -917,9 +861,6 @@ impl Session {
 
             let status = response.status().as_u16();
             let is_redir = is_redirect_status(status);
-
-            // Update session cookies from response
-            self.update_session_cookies(&response, has_request_cookies);
 
             // Update current cookies with any new cookies from this response
             for (name, value) in response.headers() {
@@ -1161,7 +1102,6 @@ impl Session {
 
         Ok(Session {
             clients: Mutex::new(HashMap::new()),
-            cookie_jar: Mutex::new(HashMap::new()),
             headers: py_headers,
             cookies: py_cookies,
             auth: py.None().into(),
@@ -1255,8 +1195,6 @@ impl Session {
         // Clear internal state
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         clients.clear();
-        let mut cookies = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
-        cookies.clear();
         Ok(())
     }
 
@@ -1304,26 +1242,6 @@ impl Session {
         Err(PyErr::from_value(
             invalid_schema.call1((format!("No connection adapters were found for {url:?}"),))?
         ))
-    }
-
-    fn get_cookies_internal(&self) -> HashMap<String, String> {
-        let jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
-        jar.clone()
-    }
-
-    fn set_cookies_internal(&self, cookies: HashMap<String, String>) {
-        let mut jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
-        jar.extend(cookies);
-    }
-
-    fn set_cookie_internal(&self, key: String, value: String) {
-        let mut jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
-        jar.insert(key, value);
-    }
-
-    fn remove_cookie_internal(&self, key: &str) {
-        let mut jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
-        jar.remove(key);
     }
 
     fn prepare_request(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
