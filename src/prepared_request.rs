@@ -416,24 +416,50 @@ impl PreparedRequest {
             return Ok(());
         }
 
-        // Parse URL using our _parse_url function (Python)
-        let models_mod = py.import("snekwest.models")?;
-        let parse_result = match models_mod.call_method1("_parse_url", (&url_str,)) {
-            Ok(r) => r,
-            Err(e) => {
-                let invalid_url = py.import("snekwest.exceptions")?.getattr("InvalidURL")?;
-                let args = e.value(py).getattr("args")?;
-                return Err(PyErr::from_value(invalid_url.call1((args,))?));
-            }
-        };
+        // Parse URL in Rust (replaces Python _parse_url)
+        let parsed = py.import("urllib.parse")?.getattr("urlparse")?.call1((&url_str,))?;
+        let scheme: String = parsed.getattr("scheme")?.extract()?;
+        let scheme: Option<String> = if scheme.is_empty() { None } else { Some(scheme) };
+        let raw_netloc: String = parsed.getattr("netloc")?.extract()?;
+        let raw_path: String = parsed.getattr("path")?.extract()?;
+        let raw_query: String = parsed.getattr("query")?.extract()?;
+        let raw_fragment: String = parsed.getattr("fragment")?.extract()?;
 
-        let scheme: Option<String> = parse_result.getattr("scheme")?.extract()?;
-        let auth: Option<String> = parse_result.getattr("auth")?.extract()?;
-        let host: Option<String> = parse_result.getattr("host")?.extract()?;
-        let port: Option<u16> = parse_result.getattr("port")?.extract().ok();
-        let path: Option<String> = parse_result.getattr("path")?.extract()?;
-        let query: Option<String> = parse_result.getattr("query")?.extract()?;
-        let fragment: Option<String> = parse_result.getattr("fragment")?.extract()?;
+        let path: Option<String> = if raw_path.is_empty() { None } else { Some(raw_path) };
+        let query: Option<String> = if raw_query.is_empty() { None } else { Some(raw_query) };
+        let fragment: Option<String> = if raw_fragment.is_empty() { None } else { Some(raw_fragment) };
+
+        // Extract auth, host, port from netloc
+        let mut auth: Option<String> = None;
+        let mut host: Option<String> = None;
+        let mut port: Option<u16> = None;
+        if !raw_netloc.is_empty() {
+            let netloc_work = if raw_netloc.contains('@') {
+                let (a, rest) = raw_netloc.rsplit_once('@').unwrap();
+                auth = Some(a.to_string());
+                rest.to_string()
+            } else {
+                raw_netloc.clone()
+            };
+            if netloc_work.starts_with('[') {
+                // IPv6
+                if let Some(bracket_end) = netloc_work.find("]:") {
+                    host = Some(netloc_work[..bracket_end + 1].to_string());
+                    port = netloc_work[bracket_end + 2..].parse().ok();
+                } else {
+                    host = Some(netloc_work);
+                }
+            } else if let Some((h, p)) = netloc_work.rsplit_once(':') {
+                if let Ok(p_num) = p.parse::<u16>() {
+                    host = Some(h.to_string());
+                    port = Some(p_num);
+                } else {
+                    host = Some(netloc_work);
+                }
+            } else {
+                host = Some(netloc_work);
+            }
+        }
 
         let scheme = match scheme {
             Some(s) if !s.is_empty() => s,
@@ -457,12 +483,7 @@ impl PreparedRequest {
         };
 
         // IDNA encoding for non-ASCII hosts
-        let unicode_is_ascii_fn = py
-            .import("snekwest._internal_utils")?
-            .getattr("unicode_is_ascii")?;
-        let is_ascii: bool = unicode_is_ascii_fn.call1((&host,))?.extract()?;
-
-        let host = if !is_ascii {
+        let host = if !host.is_ascii() {
             let idna = py.import("idna")?;
             match idna.call_method(
                 "encode",
@@ -508,14 +529,11 @@ impl PreparedRequest {
         let params_obj = params.and_then(|p| if p.is_none() { None } else { Some(p.clone()) });
 
         let query = if let Some(params_val) = params_obj {
-            // Convert string/bytes params
-            let to_native_string = py
-                .import("snekwest._internal_utils")?
-                .getattr("to_native_string")?;
-            let params_val = if params_val.is_instance_of::<PyString>()
-                || params_val.is_instance_of::<PyBytes>()
-            {
-                to_native_string.call1((&params_val,))?
+            // Convert bytes params to string
+            let params_val = if params_val.is_instance_of::<PyBytes>() {
+                let bytes: Vec<u8> = params_val.extract()?;
+                let s = String::from_utf8(bytes).unwrap_or_default();
+                s.into_pyobject(py)?.into_any().into()
             } else {
                 params_val
             };
@@ -535,26 +553,18 @@ impl PreparedRequest {
             query
         };
 
-        // Build URL with urlunparse
-        let urlunparse = py.import("urllib.parse")?.getattr("urlunparse")?;
-        let parts = PyList::new(
-            py,
-            &[
-                scheme.as_str(),
-                &netloc,
-                &path,
-                "",
-                query.as_deref().unwrap_or(""),
-                fragment.as_deref().unwrap_or(""),
-            ],
-        )?;
+        // Build URL in Rust (replaces Python urlunparse + requote_uri)
+        let mut raw_url = format!("{}://{}{}", scheme, netloc, path);
+        if let Some(ref q) = query {
+            raw_url.push('?');
+            raw_url.push_str(q);
+        }
+        if let Some(ref f) = fragment {
+            raw_url.push('#');
+            raw_url.push_str(f);
+        }
 
-        let raw_url: String = urlunparse.call1((&parts,))?.extract()?;
-
-        // requote_uri
-        let requote = py.import("snekwest.utils")?.getattr("requote_uri")?;
-        let final_url: String = requote.call1((&raw_url,))?.extract()?;
-
+        let final_url = crate::utils::requote_uri(py, &raw_url)?;
         self.url = Some(final_url);
         Ok(())
     }
