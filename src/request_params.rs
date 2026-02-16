@@ -14,6 +14,7 @@ pub struct RequestParams {
     pub files: Option<HashMap<String, String>>,
     pub auth: Option<(String, String)>,
     pub timeout: Option<TimeoutParameter>,
+    #[allow(dead_code)]
     pub allow_redirects: bool,
     pub proxies: Option<HashMap<String, String>>,
     pub stream: Option<bool>,

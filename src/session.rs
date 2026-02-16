@@ -89,6 +89,7 @@ fn is_redirect_status(status: u16) -> bool {
 
 /// Decide whether the Authorization header should be stripped when redirecting
 /// from `old_url` to `new_url`. Mirrors requests' `should_strip_auth`.
+#[allow(dead_code)]
 fn should_strip_auth(old_url: &str, new_url: &str) -> bool {
     let old = match url::Url::parse(old_url) {
         Ok(u) => u,
@@ -848,7 +849,7 @@ impl Session {
         })
     }
 
-    fn do_request(&self, mut params: RequestParams) -> PyResult<RawResponseData> {
+    fn do_request(&self, params: RequestParams) -> PyResult<RawResponseData> {
         let client = self.get_or_create_client(&params)?;
         let start = Instant::now();
 
@@ -859,292 +860,103 @@ impl Session {
 
         let has_proxies = params.proxies.as_ref().map_or(false, |p| !p.is_empty());
 
-        let original_method = params.method.clone();
+        let method = params.method.clone();
         let request_url = params.url.clone();
         let has_request_cookies = params.cookies.is_some();
 
-        // Determine auth from request params
         let auth = params.auth.clone();
         let extra_headers: Option<HashMap<String, String>> = None;
 
-        // Build merged cookies for the first request
         let merged_cookies = self.merge_cookies(&params);
 
-        // Collect request headers for the Request object on the final response
-        // We'll capture them from the first redirect step
-        let mut current_method = original_method.clone();
-        let mut current_url = request_url.clone();
-        let mut history: Vec<RawResponseData> = Vec::new();
-        let mut current_cookies = merged_cookies;
-        let mut current_auth = auth.clone();
-        let max_redirects = if params.allow_redirects {
-            self.max_redirects
+        // Build the actual request headers we'll send
+        let mut req_headers: HashMap<String, String> = HashMap::new();
+        if let Some(ref h) = params.headers {
+            req_headers.extend(h.clone());
+        }
+        if let Some((ref u, ref p)) = auth {
+            use base64::Engine;
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p));
+            req_headers.insert("Authorization".to_string(), format!("Basic {}", encoded));
+        }
+        if params.json.is_some() {
+            req_headers.insert("Content-Type".to_string(), "application/json".to_string());
+        }
+
+        // Redirects are handled by Python's SessionRedirectMixin.resolve_redirects(),
+        // so we always perform a single-hop request here.
+        let response = self.execute_single_request(
+            &client,
+            &method,
+            &request_url,
+            &params,
+            &merged_cookies,
+            &auth,
+            &extra_headers,
+            had_explicit_connect_timeout,
+            has_proxies,
+        )?;
+
+        let status = response.status().as_u16();
+        let is_redir = is_redirect_status(status);
+
+        // Update session cookies from response
+        self.update_session_cookies(&response, has_request_cookies);
+
+        let resp_headers = Self::extract_response_headers(&response);
+        let resp_cookies = Self::extract_response_cookies(&response);
+        let reason = reason_phrase(status);
+        let resp_url = response.url().to_string();
+
+        // For streaming requests with chunked transfer (no Content-Length),
+        // create a StreamingBody for lazy chunk-at-a-time reading instead
+        // of calling response.bytes() which hangs when the server doesn't
+        // close the connection promptly.
+        let is_stream = params.stream.unwrap_or(false);
+        let has_content_length = response.headers().contains_key("content-length");
+        let streaming = is_stream && !has_content_length;
+
+        let (body, streaming_inner_opt) = if streaming {
+            let inner = StreamingInner(Arc::new(Mutex::new(Some(response))));
+            (Vec::new(), Some(inner))
         } else {
-            0
+            (response.bytes().unwrap_or_default().to_vec(), None)
         };
 
-        // Track request headers for each hop
-        #[allow(unused_assignments)]
-        let mut final_request_headers: HashMap<String, String> = HashMap::new();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        loop {
-            // Build the actual request headers we'll send
-            let mut req_headers: HashMap<String, String> = HashMap::new();
-            if let Some(ref h) = extra_headers {
-                req_headers.extend(h.clone());
+        // Append fragment to URL if present in original request
+        let mut final_url = resp_url;
+        if let Some(frag_pos) = request_url.find('#') {
+            let fragment = &request_url[frag_pos..];
+            if !final_url.contains('#') {
+                final_url.push_str(fragment);
             }
-            if let Some(ref h) = params.headers {
-                req_headers.extend(h.clone());
-            }
-            if let Some((ref u, ref p)) = current_auth {
-                // Basic auth header
-                use base64::Engine;
-                let encoded =
-                    base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p));
-                req_headers.insert("Authorization".to_string(), format!("Basic {}", encoded));
-            }
-            // Track Content-Type for json requests
-            if params.json.is_some() {
-                req_headers.insert("Content-Type".to_string(), "application/json".to_string());
-            }
-
-            let response = self.execute_single_request(
-                &client,
-                &current_method,
-                &current_url,
-                &params,
-                &current_cookies,
-                &current_auth,
-                &extra_headers,
-                had_explicit_connect_timeout,
-                has_proxies,
-            )?;
-
-            let status = response.status().as_u16();
-            let is_redir = is_redirect_status(status);
-
-            // Update session cookies from response
-            self.update_session_cookies(&response, has_request_cookies);
-
-            // Update current cookies with any new cookies from this response
-            for (name, value) in response.headers() {
-                if name.as_str().to_lowercase() == "set-cookie" {
-                    if let Ok(cookie_str) = value.to_str() {
-                        if let Some(cookie_pair) = cookie_str.split(';').next() {
-                            if let Some((key, val)) = cookie_pair.split_once('=') {
-                                current_cookies
-                                    .insert(key.trim().to_string(), val.trim().to_string());
-                            }
-                        }
-                    }
-                }
-            }
-
-            if is_redir && params.allow_redirects {
-                if history.len() >= max_redirects {
-                    return Python::attach(|py| {
-                        Err(raise_exception(
-                            py,
-                            "TooManyRedirects",
-                            format!("Exceeded {} redirects.", max_redirects),
-                        ))
-                    });
-                }
-
-                // Get redirect location — if missing, treat as final response
-                let location = match response
-                    .headers()
-                    .get("location")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-                {
-                    Some(loc) => loc,
-                    None => {
-                        // No Location header — return this as the final response
-                        let resp_headers = Self::extract_response_headers(&response);
-                        let resp_cookies = Self::extract_response_cookies(&response);
-                        let reason = reason_phrase(status);
-                        let resp_url = response.url().to_string();
-                        let body = response
-                            .bytes()
-                            .map_err(|e| {
-                                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                            })?
-                            .to_vec();
-                        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                        final_request_headers = req_headers;
-                        let mut final_url = resp_url;
-                        if let Some(frag_pos) = request_url.find('#') {
-                            let fragment = &request_url[frag_pos..];
-                            if !final_url.contains('#') {
-                                final_url.push_str(fragment);
-                            }
-                        }
-                        return Ok(RawResponseData {
-                            status,
-                            url: final_url,
-                            headers: resp_headers,
-                            body,
-                            elapsed_ms,
-                            history,
-                            cookies: resp_cookies,
-                            reason,
-                            is_redirect: is_redir,
-                            method: current_method,
-                            request_url,
-                            request_headers: final_request_headers,
-                            streaming_inner: None,
-                            streaming_headers: None,
-                        });
-                    }
-                };
-
-                let resp_headers = Self::extract_response_headers(&response);
-                let resp_cookies = Self::extract_response_cookies(&response);
-                let reason = reason_phrase(status);
-                let resp_url = response.url().to_string();
-
-                // Read body for intermediate response
-                let body = response.bytes().unwrap_or_default().to_vec();
-
-                // Build intermediate response for history
-                let intermediate = RawResponseData {
-                    status,
-                    url: resp_url,
-                    headers: resp_headers,
-                    body,
-                    elapsed_ms: 0.0,
-                    history: Vec::new(),
-                    cookies: resp_cookies,
-                    reason,
-                    is_redirect: true,
-                    method: current_method.clone(),
-                    request_url: current_url.clone(),
-                    request_headers: req_headers.clone(),
-                    streaming_inner: None,
-                    streaming_headers: None,
-                };
-                history.push(intermediate);
-
-                let previous_url = current_url.clone();
-
-                // Resolve redirect URL against current URL
-                current_url = if let Ok(base) = url::Url::parse(&current_url) {
-                    base.join(&location).map(|u| u.to_string()).unwrap_or(location)
-                } else {
-                    location
-                };
-
-                // Maintain fragment from original URL
-                if let Some(frag_pos) = request_url.find('#') {
-                    let fragment = &request_url[frag_pos..];
-                    if !current_url.contains('#') {
-                        current_url.push_str(fragment);
-                    }
-                }
-
-                // Strip auth when redirecting to a different host/scheme
-                if should_strip_auth(&previous_url, &current_url) {
-                    current_auth = None;
-                    params.headers.as_mut().map(|h| h.remove("Authorization"));
-                }
-
-                // 301: only POST -> GET (other methods preserved)
-                // 302, 303: all non-HEAD -> GET
-                let method_changed;
-                if status == 301 && current_method.to_uppercase() == "POST" {
-                    current_method = "GET".to_string();
-                    method_changed = true;
-                } else if matches!(status, 302 | 303)
-                    && current_method.to_uppercase() != "HEAD"
-                {
-                    current_method = "GET".to_string();
-                    method_changed = true;
-                } else {
-                    method_changed = false;
-                }
-                // 307, 308: method stays the same
-
-                // Strip body and content headers when method changed to GET
-                if method_changed {
-                    params.data = None;
-                    params.json = None;
-                    params.files = None;
-                    if let Some(ref mut h) = params.headers {
-                        h.remove("Content-Length");
-                        h.remove("content-length");
-                        h.remove("Content-Type");
-                        h.remove("content-type");
-                        h.remove("Transfer-Encoding");
-                        h.remove("transfer-encoding");
-                    }
-                }
-
-                // Don't re-apply query params on redirect URLs
-                params.params = None;
-                continue;
-            }
-
-            // Final response
-            let resp_headers = Self::extract_response_headers(&response);
-            let resp_cookies = Self::extract_response_cookies(&response);
-            let reason = reason_phrase(status);
-            let resp_url = response.url().to_string();
-
-            // For streaming requests with chunked transfer (no Content-Length),
-            // create a StreamingBody for lazy chunk-at-a-time reading instead
-            // of calling response.bytes() which hangs when the server doesn't
-            // close the connection promptly.
-            let is_stream = params.stream.unwrap_or(false);
-            let has_content_length = response.headers().contains_key("content-length");
-            let streaming = is_stream && !has_content_length;
-
-            // Consume response in exactly one branch to satisfy the borrow checker.
-            // For streaming, wrap in Arc<Mutex> for lazy reading; otherwise read eagerly.
-            let (body, streaming_inner_opt) = if streaming {
-                let inner = StreamingInner(Arc::new(Mutex::new(Some(response))));
-                (Vec::new(), Some(inner))
-            } else {
-                (response.bytes().unwrap_or_default().to_vec(), None)
-            };
-
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            // For the final response, update final_request_headers
-            final_request_headers = req_headers;
-
-            // Append fragment to URL if present in original request
-            let mut final_url = resp_url;
-            if let Some(frag_pos) = request_url.find('#') {
-                let fragment = &request_url[frag_pos..];
-                if !final_url.contains('#') {
-                    final_url.push_str(fragment);
-                }
-            }
-
-            let streaming_hdrs = if streaming_inner_opt.is_some() {
-                Some(resp_headers.clone())
-            } else {
-                None
-            };
-
-            return Ok(RawResponseData {
-                status,
-                url: final_url,
-                headers: resp_headers,
-                body,
-                elapsed_ms,
-                history,
-                cookies: resp_cookies,
-                reason,
-                is_redirect: is_redir,
-                method: current_method,
-                request_url,
-                request_headers: final_request_headers,
-                streaming_inner: streaming_inner_opt,
-                streaming_headers: streaming_hdrs,
-            });
         }
+
+        let streaming_hdrs = if streaming_inner_opt.is_some() {
+            Some(resp_headers.clone())
+        } else {
+            None
+        };
+
+        Ok(RawResponseData {
+            status,
+            url: final_url,
+            headers: resp_headers,
+            body,
+            elapsed_ms,
+            history: Vec::new(),
+            cookies: resp_cookies,
+            reason,
+            is_redirect: is_redir,
+            method,
+            request_url,
+            request_headers: req_headers,
+            streaming_inner: streaming_inner_opt,
+            streaming_headers: streaming_hdrs,
+        })
     }
 }
 
