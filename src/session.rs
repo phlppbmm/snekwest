@@ -246,15 +246,22 @@ fn repr_str(s: &str) -> String {
 /// This avoids false positives from URLs containing "ssl" in the path.
 fn is_ssl_error(e: &reqwest::Error) -> bool {
     use std::error::Error;
-    // Skip the top-level reqwest error (which contains the URL) and check sources
     let mut source: Option<&dyn Error> = e.source();
     while let Some(s) = source {
+        // Type-safe detection: any rustls::Error is definitively an SSL error
+        if s.downcast_ref::<rustls::Error>().is_some() {
+            return true;
+        }
+        // String fallback for other TLS backends or wrapped errors
         let msg = s.to_string().to_lowercase();
         if msg.contains("certificate")
             || msg.contains("handshake")
             || msg.contains("unknown issuer")
             || msg.contains("self signed")
+            || msg.contains("self-signed")
             || msg.contains("alertreceived")
+            || msg.contains("expired")
+            || msg.contains("revoked")
         {
             return true;
         }
