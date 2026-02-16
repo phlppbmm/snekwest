@@ -603,18 +603,13 @@ impl Session {
         }
 
         // Set per-request timeout for the overall request duration.
-        // Note: connect_timeout is set on the client builder in create_client_for_config.
-        // For Single timeouts, we add a small margin (50ms) so that connect_timeout
-        // fires first for connect-phase failures (avoiding a race condition in reqwest
-        // where request.timeout fires before connect_timeout).
+        // connect_timeout is set on the client builder in create_client_for_config.
         if let Some(timeout_params) = &params.timeout {
             match timeout_params {
                 TimeoutParameter::Single(secs) => {
-                    // Add 50ms margin so connect_timeout fires first
-                    request = request.timeout(std::time::Duration::from_secs_f64(*secs + 0.05));
+                    request = request.timeout(std::time::Duration::from_secs_f64(*secs));
                 }
                 TimeoutParameter::Pair(connect, Some(read)) => {
-                    // Overall timeout = connect + read so connect_timeout fires first
                     let connect_secs = connect.unwrap_or(0.0);
                     request = request.timeout(std::time::Duration::from_secs_f64(
                         connect_secs + *read,
