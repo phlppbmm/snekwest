@@ -1,4 +1,4 @@
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use std::collections::HashMap;
@@ -10,7 +10,6 @@ use crate::case_insensitive_dict::CaseInsensitiveDict;
 
 const REDIRECT_STATI: [u16; 5] = [301, 302, 303, 307, 308];
 const CONTENT_CHUNK_SIZE: usize = 10 * 1024;
-const ITER_CHUNK_SIZE: usize = 512;
 
 // ---------------------------------------------------------------------------
 // StreamingInner / StreamingBody (unchanged from before)
@@ -53,7 +52,7 @@ impl StreamingBody {
         let Some(mut response) = response_opt else {
             return Ok(Vec::new());
         };
-        let (response_back, result) = py.allow_threads(move || {
+        let (response_back, result) = py.detach(move || {
             let mut buf = vec![0u8; size];
             match response.read(&mut buf) {
                 Ok(0) => (response, Ok(Vec::new())),
@@ -368,6 +367,7 @@ impl Response {
 // ---------------------------------------------------------------------------
 
 #[pymethods]
+#[allow(non_snake_case)]
 impl Response {
     #[new]
     fn py_new(py: Python<'_>) -> PyResult<Self> {
@@ -450,7 +450,7 @@ impl Response {
             .map_or_else(|| py.None().into(), |e| e.clone_ref(py))
     }
     #[setter]
-    fn set_encoding(&mut self, py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
+    fn set_encoding(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
         if v.is_none() {
             self.encoding_inner = None;
         } else {
@@ -484,7 +484,7 @@ impl Response {
             .map_or_else(|| py.None().into(), |r| r.clone_ref(py))
     }
     #[setter]
-    fn set_reason(&mut self, py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
+    fn set_reason(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
         if v.is_none() {
             self.reason_inner = None;
         } else {
@@ -509,7 +509,7 @@ impl Response {
             .map_or_else(|| py.None().into(), |r| r.clone_ref(py))
     }
     #[setter]
-    fn set_request(&mut self, py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
+    fn set_request(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
         if v.is_none() {
             self.request_inner = None;
         } else {
@@ -532,7 +532,7 @@ impl Response {
             .map_or_else(|| py.None().into(), |n| n.clone_ref(py))
     }
     #[setter(_next)]
-    fn set__next(&mut self, py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
+    fn set__next(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
         if v.is_none() {
             self.next_inner = None;
         } else {
@@ -548,7 +548,7 @@ impl Response {
             .map_or_else(|| py.None().into(), |c| c.clone_ref(py))
     }
     #[setter]
-    fn set_connection(&mut self, py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
+    fn set_connection(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
         if v.is_none() {
             self.connection_inner = None;
         } else {
@@ -564,7 +564,7 @@ impl Response {
             .map_or_else(|| py.None().into(), |r| r.clone_ref(py))
     }
     #[setter]
-    fn set_raw(&mut self, py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
+    fn set_raw(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
         if v.is_none() {
             self.raw_inner = None;
         } else {
@@ -584,7 +584,7 @@ impl Response {
         }
     }
     #[setter(_content)]
-    fn set__content(&mut self, py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
+    fn set__content(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
         if v.is_instance_of::<pyo3::types::PyBool>() {
             // _content = False means not loaded
             self.content_loaded = false;
@@ -811,7 +811,6 @@ impl Response {
                 raw: None,
                 chunk_size: cs.unwrap_or(0),
                 done: false,
-                parent_consumed_flag: false,
             }
         } else {
             // Stream from raw
@@ -821,7 +820,6 @@ impl Response {
                 raw: self.raw_inner.as_ref().map(|r| r.clone_ref(py)),
                 chunk_size: cs.unwrap_or(1),
                 done: false,
-                parent_consumed_flag: true,
             }
         };
 
@@ -975,7 +973,6 @@ pub struct ContentIterator {
     raw: Option<Py<PyAny>>,
     chunk_size: usize,
     done: bool,
-    parent_consumed_flag: bool,
 }
 
 #[pymethods]

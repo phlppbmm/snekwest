@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBool, PyDict};
+use pyo3::types::{PyBool, PyDict};
 use pythonize::depythonize;
 use reqwest::blocking::{Client, ClientBuilder};
 use std::collections::HashMap;
@@ -908,9 +908,6 @@ impl Session {
                 req_headers.insert("Content-Type".to_string(), "application/json".to_string());
             }
 
-            // Track request headers for each hop
-            final_request_headers = req_headers.clone();
-
             let response = self.execute_single_request(
                 &client,
                 &current_method,
@@ -1148,11 +1145,6 @@ impl Session {
                 streaming_headers: streaming_hdrs,
             });
         }
-
-        // Should not be reached, but just in case
-        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-            "Unexpected end of redirect chain",
-        ))
     }
 }
 
@@ -1426,7 +1418,7 @@ impl Session {
         let merge_setting = sessions_mod.getattr("merge_setting")?;
         let os = py.import("os")?;
 
-        let mut proxies = proxies.unbind();
+        let proxies = proxies.unbind();
         let mut verify = verify.unbind();
 
         if self.trust_env {
@@ -1558,7 +1550,7 @@ impl Session {
         send_kwargs.set_item("timeout", timeout.as_ref().map_or_else(|| py.None(), |t| t.clone_ref(py)))?;
         send_kwargs.set_item("allow_redirects", allow_redirects)?;
         let settings_bound = settings.bind(py);
-        if let Ok(settings_dict) = settings_bound.downcast::<PyDict>() {
+        if let Ok(settings_dict) = settings_bound.cast::<PyDict>() {
             for (k, v) in settings_dict.iter() {
                 send_kwargs.set_item(k, v)?;
             }

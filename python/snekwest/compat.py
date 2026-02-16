@@ -6,7 +6,6 @@ This module handles import compatibility, mirroring requests.compat.
 """
 
 import importlib
-import sys
 
 # snekwest does not use urllib3, so set is_urllib3_1 = False
 is_urllib3_1 = False
@@ -33,12 +32,6 @@ chardet = _resolve_char_detection()
 # -------
 # Pythons
 # -------
-
-# Syntax sugar.
-_ver = sys.version_info
-
-#: Python 3.x?
-is_py3 = _ver[0] == 3
 
 # json/simplejson module import resolution
 has_simplejson = False
@@ -88,5 +81,4 @@ builtin_str = str
 str = str  # noqa: A001 — re-export for conftest module swap compatibility
 bytes = bytes  # noqa: A001 — re-export for conftest module swap compatibility
 basestring = (str, bytes)
-numeric_types = (int, float)
 integer_types = (int,)
