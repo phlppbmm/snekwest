@@ -44,9 +44,11 @@ impl StreamingBody {
             return Ok(Vec::new());
         }
         let response_opt = {
-            let mut guard = self.inner.0.lock().map_err(|e| {
-                PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-            })?;
+            let mut guard = self
+                .inner
+                .0
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             guard.take()
         };
         let Some(mut response) = response_opt else {
@@ -66,18 +68,22 @@ impl StreamingBody {
         let data = result.map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("Stream read error: {}", e))
         })?;
-        let mut guard = self.inner.0.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
+        let mut guard = self
+            .inner
+            .0
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
         *guard = Some(response_back);
         Ok(data)
     }
 
     fn close(&mut self) -> PyResult<()> {
         self.closed = true;
-        let mut guard = self.inner.0.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
+        let mut guard = self
+            .inner
+            .0
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
         *guard = None;
         Ok(())
     }
@@ -199,15 +205,12 @@ impl Response {
         let (content_bytes, content_loaded, content_consumed, raw) =
             if let Some(streaming) = data.streaming_inner {
                 // Streaming: wrap in StreamingRawResponse
-                let streaming_hdrs_map: HashMap<String, String> =
-                    data.streaming_headers.unwrap_or_default().into_iter().collect();
-                let sb = Py::new(
-                    py,
-                    StreamingBody::new(
-                        streaming,
-                        streaming_hdrs_map,
-                    ),
-                )?;
+                let streaming_hdrs_map: HashMap<String, String> = data
+                    .streaming_headers
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                let sb = Py::new(py, StreamingBody::new(streaming, streaming_hdrs_map))?;
                 let streaming_cls = py
                     .import("snekwest.models")?
                     .getattr("StreamingRawResponse")?;
@@ -225,18 +228,11 @@ impl Response {
                 ns_kwargs.set_item("msg", &msg)?;
                 let fake_resp = ns_cls.call((), Some(&ns_kwargs))?;
                 bio.setattr("_original_response", &fake_resp)?;
-                (
-                    Some(data.body),
-                    true,
-                    true,
-                    Some(bio.unbind()),
-                )
+                (Some(data.body), true, true, Some(bio.unbind()))
             };
 
         // 8. Build request PreparedRequest
-        let prep_cls = py
-            .import("snekwest.models")?
-            .getattr("PreparedRequest")?;
+        let prep_cls = py.import("snekwest.models")?.getattr("PreparedRequest")?;
         let req = prep_cls.call0()?;
         req.setattr("method", data.method.to_uppercase())?;
         req.setattr("url", &data.request_url)?;
@@ -302,9 +298,7 @@ impl Response {
         let raw = self.raw_inner.as_ref().unwrap();
         let mut all_bytes: Vec<u8> = Vec::new();
         loop {
-            let chunk_obj = raw
-                .bind(py)
-                .call_method1("read", (CONTENT_CHUNK_SIZE,))?;
+            let chunk_obj = raw.bind(py).call_method1("read", (CONTENT_CHUNK_SIZE,))?;
             let chunk: Vec<u8> = chunk_obj.extract()?;
             if chunk.is_empty() {
                 break;
@@ -335,12 +329,8 @@ impl Response {
                 // Use apparent_encoding
                 let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
                 if !chardet.is_none() {
-                    let result = chardet.call_method1(
-                        "detect",
-                        (PyBytes::new(py, bytes),),
-                    )?;
-                    let enc: Option<String> =
-                        result.get_item("encoding")?.extract()?;
+                    let result = chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
+                    let enc: Option<String> = result.get_item("encoding")?.extract()?;
                     enc.unwrap_or_else(|| "utf-8".to_string())
                 } else {
                     "utf-8".to_string()
@@ -350,9 +340,7 @@ impl Response {
 
         // Decode
         let py_bytes = PyBytes::new(py, bytes);
-        match py_bytes
-            .call_method1("decode", (&encoding, "replace"))
-        {
+        match py_bytes.call_method1("decode", (&encoding, "replace")) {
             Ok(s) => s.extract(),
             Err(_) => {
                 // Fallback: decode without explicit encoding
@@ -361,7 +349,6 @@ impl Response {
             }
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -414,9 +401,10 @@ impl Response {
 
     #[getter]
     fn url(&self, py: Python<'_>) -> Py<PyAny> {
-        self.url_inner
-            .as_ref()
-            .map_or_else(|| py.None().into(), |u| u.into_pyobject(py).unwrap().into_any().unbind())
+        self.url_inner.as_ref().map_or_else(
+            || py.None(),
+            |u| u.into_pyobject(py).unwrap().into_any().unbind(),
+        )
     }
     #[setter]
     fn set_url(&mut self, v: Option<String>) {
@@ -427,7 +415,7 @@ impl Response {
     fn headers(&self, py: Python<'_>) -> Py<PyAny> {
         self.headers_inner
             .as_ref()
-            .map_or_else(|| py.None().into(), |h| h.clone_ref(py).into_any())
+            .map_or_else(|| py.None(), |h| h.clone_ref(py).into_any())
     }
     #[setter]
     fn set_headers(&mut self, py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
@@ -449,7 +437,7 @@ impl Response {
     fn encoding(&self, py: Python<'_>) -> Py<PyAny> {
         self.encoding_inner
             .as_ref()
-            .map_or_else(|| py.None().into(), |e| e.clone_ref(py))
+            .map_or_else(|| py.None(), |e| e.clone_ref(py))
     }
     #[setter]
     fn set_encoding(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
@@ -483,7 +471,7 @@ impl Response {
     fn reason(&self, py: Python<'_>) -> Py<PyAny> {
         self.reason_inner
             .as_ref()
-            .map_or_else(|| py.None().into(), |r| r.clone_ref(py))
+            .map_or_else(|| py.None(), |r| r.clone_ref(py))
     }
     #[setter]
     fn set_reason(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
@@ -508,7 +496,7 @@ impl Response {
     fn request(&self, py: Python<'_>) -> Py<PyAny> {
         self.request_inner
             .as_ref()
-            .map_or_else(|| py.None().into(), |r| r.clone_ref(py))
+            .map_or_else(|| py.None(), |r| r.clone_ref(py))
     }
     #[setter]
     fn set_request(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
@@ -524,14 +512,14 @@ impl Response {
     fn get_next(&self, py: Python<'_>) -> Py<PyAny> {
         self.next_inner
             .as_ref()
-            .map_or_else(|| py.None().into(), |n| n.clone_ref(py))
+            .map_or_else(|| py.None(), |n| n.clone_ref(py))
     }
 
     #[getter(_next)]
     fn get__next(&self, py: Python<'_>) -> Py<PyAny> {
         self.next_inner
             .as_ref()
-            .map_or_else(|| py.None().into(), |n| n.clone_ref(py))
+            .map_or_else(|| py.None(), |n| n.clone_ref(py))
     }
     #[setter(_next)]
     fn set__next(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
@@ -547,7 +535,7 @@ impl Response {
     fn connection(&self, py: Python<'_>) -> Py<PyAny> {
         self.connection_inner
             .as_ref()
-            .map_or_else(|| py.None().into(), |c| c.clone_ref(py))
+            .map_or_else(|| py.None(), |c| c.clone_ref(py))
     }
     #[setter]
     fn set_connection(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
@@ -563,7 +551,7 @@ impl Response {
     fn raw(&self, py: Python<'_>) -> Py<PyAny> {
         self.raw_inner
             .as_ref()
-            .map_or_else(|| py.None().into(), |r| r.clone_ref(py))
+            .map_or_else(|| py.None(), |r| r.clone_ref(py))
     }
     #[setter]
     fn set_raw(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
@@ -582,7 +570,7 @@ impl Response {
         }
         match &self.content_bytes {
             Some(bytes) => Ok(PyBytes::new(py, bytes).into_any().unbind()),
-            None => Ok(py.None().into()),
+            None => Ok(py.None()),
         }
     }
     #[setter(_content)]
@@ -619,7 +607,7 @@ impl Response {
         self.content_consumed = true;
         match &self.content_bytes {
             Some(bytes) => Ok(PyBytes::new(py, bytes).into_any().unbind()),
-            None => Ok(py.None().into()),
+            None => Ok(py.None()),
         }
     }
 
@@ -662,12 +650,8 @@ impl Response {
     fn apparent_encoding(&self, py: Python<'_>) -> PyResult<String> {
         let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
         if !chardet.is_none() {
-            let bytes = self
-                .content_bytes
-                .as_deref()
-                .unwrap_or(b"");
-            let result =
-                chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
+            let bytes = self.content_bytes.as_deref().unwrap_or(b"");
+            let result = chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
             let enc: Option<String> = result.get_item("encoding")?.extract()?;
             Ok(enc.unwrap_or_else(|| "utf-8".to_string()))
         } else {
@@ -689,9 +673,7 @@ impl Response {
         };
         let dict = PyDict::new(py);
         if let Some(header_str) = header {
-            let parse_fn = py
-                .import("snekwest.utils")?
-                .getattr("parse_header_links")?;
+            let parse_fn = py.import("snekwest.utils")?.getattr("parse_header_links")?;
             let links_list = parse_fn.call1((&header_str,))?;
             for link_obj in links_list.try_iter()? {
                 let link = link_obj?;
@@ -707,11 +689,7 @@ impl Response {
     // -- Methods --
 
     #[pyo3(signature = (**kwargs))]
-    fn json(
-        &mut self,
-        py: Python<'_>,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Py<PyAny>> {
+    fn json(&mut self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         self.ensure_content_loaded(py)?;
         self.content_consumed = true;
 
@@ -729,26 +707,21 @@ impl Response {
         let has_encoding = self.encoding_inner.is_some();
         if !has_encoding && bytes.len() > 3 {
             let guess_fn = py.import("snekwest.utils")?.getattr("guess_json_utf")?;
-            let enc: Option<String> =
-                guess_fn.call1((PyBytes::new(py, &bytes),))?.extract()?;
+            let enc: Option<String> = guess_fn.call1((PyBytes::new(py, &bytes),))?.extract()?;
             if let Some(enc) = enc {
-                let decoded = PyBytes::new(py, &bytes)
-                    .call_method1("decode", (&enc,));
+                let decoded = PyBytes::new(py, &bytes).call_method1("decode", (&enc,));
                 if let Ok(decoded) = decoded {
                     match json_mod.call_method("loads", (&decoded,), kwargs) {
                         Ok(result) => return Ok(result.unbind()),
                         Err(e) => {
-                            let jde_cls =
-                                json_mod.getattr("JSONDecodeError")?;
+                            let jde_cls = json_mod.getattr("JSONDecodeError")?;
                             if e.is_instance(py, &jde_cls) {
                                 let v = e.value(py);
-                                return Err(PyErr::from_value(
-                                    requests_jde.call1((
-                                        v.getattr("msg")?,
-                                        v.getattr("doc")?,
-                                        v.getattr("pos")?,
-                                    ))?,
-                                ));
+                                return Err(PyErr::from_value(requests_jde.call1((
+                                    v.getattr("msg")?,
+                                    v.getattr("doc")?,
+                                    v.getattr("pos")?,
+                                ))?));
                             }
                             // UnicodeDecodeError: fall through
                             if !e.is_instance_of::<pyo3::exceptions::PyUnicodeDecodeError>(py) {
@@ -768,13 +741,11 @@ impl Response {
                 let jde_cls = json_mod.getattr("JSONDecodeError")?;
                 if e.is_instance(py, &jde_cls) {
                     let v = e.value(py);
-                    Err(PyErr::from_value(
-                        requests_jde.call1((
-                            v.getattr("msg")?,
-                            v.getattr("doc")?,
-                            v.getattr("pos")?,
-                        ))?,
-                    ))
+                    Err(PyErr::from_value(requests_jde.call1((
+                        v.getattr("msg")?,
+                        v.getattr("doc")?,
+                        v.getattr("pos")?,
+                    ))?))
                 } else {
                     Err(e)
                 }
@@ -837,9 +808,7 @@ impl Response {
             let ns_kwargs = PyDict::new(py);
             ns_kwargs.set_item("encoding", self.encoding(py))?;
             let resp_proxy = ns_cls.call((), Some(&ns_kwargs))?;
-            Ok(stream_decode
-                .call1((&iter_py, &resp_proxy))?
-                .unbind())
+            Ok(stream_decode.call1((&iter_py, &resp_proxy))?.unbind())
         } else {
             Ok(iter_py.into_any())
         }
@@ -854,11 +823,10 @@ impl Response {
         delimiter: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         // Get the content iterator
-        let content_iter =
-            self.iter_content(py, Some(chunk_size), decode_unicode)?;
+        let content_iter = self.iter_content(py, Some(chunk_size), decode_unicode)?;
 
         let iter = LinesIterator {
-            content_iter: content_iter,
+            content_iter,
             pending: None,
             buffered_lines: Vec::new(),
             buffered_pos: 0,
@@ -914,7 +882,11 @@ impl Response {
 }
 
 impl Response {
-    fn raise_for_status_impl(&self, py: Python<'_>, response_obj: Option<Py<PyAny>>) -> PyResult<()> {
+    fn raise_for_status_impl(
+        &self,
+        py: Python<'_>,
+        response_obj: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
         let status = self.status_code.unwrap_or(0);
 
         let reason: String = match &self.reason_inner {
@@ -923,9 +895,7 @@ impl Response {
                 if r_bound.is_instance_of::<PyBytes>() {
                     match r_bound.call_method1("decode", ("utf-8",)) {
                         Ok(s) => s.extract()?,
-                        Err(_) => r_bound
-                            .call_method1("decode", ("iso-8859-1",))?
-                            .extract()?,
+                        Err(_) => r_bound.call_method1("decode", ("iso-8859-1",))?.extract()?,
                     }
                 } else {
                     r_bound.str()?.to_string()
@@ -951,11 +921,14 @@ impl Response {
         };
 
         if let Some(error_msg) = msg {
-            let http_error_cls = py
-                .import("snekwest.exceptions")?
-                .getattr("HTTPError")?;
+            let http_error_cls = py.import("snekwest.exceptions")?.getattr("HTTPError")?;
             let kwargs = PyDict::new(py);
-            kwargs.set_item("response", response_obj.as_ref().map_or_else(|| py.None(), |r| r.clone_ref(py)))?;
+            kwargs.set_item(
+                "response",
+                response_obj
+                    .as_ref()
+                    .map_or_else(|| py.None(), |r| r.clone_ref(py)),
+            )?;
             return Err(PyErr::from_value(
                 http_error_cls.call((error_msg,), Some(&kwargs))?,
             ));
@@ -1001,9 +974,7 @@ impl ContentIterator {
                     self.done = true;
                     return Ok(None);
                 }
-                return Ok(Some(
-                    PyBytes::new(py, content).into_any().unbind(),
-                ));
+                return Ok(Some(PyBytes::new(py, content).into_any().unbind()));
             }
             if self.pos >= content.len() {
                 self.done = true;
@@ -1015,17 +986,13 @@ impl ContentIterator {
             Ok(Some(PyBytes::new(py, chunk).into_any().unbind()))
         } else if let Some(ref raw) = self.raw {
             // Streaming from raw
-            let chunk = raw
-                .bind(py)
-                .call_method1("read", (self.chunk_size,))?;
+            let chunk = raw.bind(py).call_method1("read", (self.chunk_size,))?;
             let chunk_bytes: Vec<u8> = chunk.extract()?;
             if chunk_bytes.is_empty() {
                 self.done = true;
                 return Ok(None);
             }
-            Ok(Some(
-                PyBytes::new(py, &chunk_bytes).into_any().unbind(),
-            ))
+            Ok(Some(PyBytes::new(py, &chunk_bytes).into_any().unbind()))
         } else {
             self.done = true;
             Ok(None)
@@ -1085,7 +1052,10 @@ impl LinesIterator {
 
             // Prepend pending
             let chunk = if let Some(pending) = self.pending.take() {
-                pending.bind(py).call_method1("__add__", (&chunk,))?.unbind()
+                pending
+                    .bind(py)
+                    .call_method1("__add__", (&chunk,))?
+                    .unbind()
             } else {
                 chunk.unbind()
             };
@@ -1110,10 +1080,8 @@ impl LinesIterator {
 
             let last_incomplete = if last_truthy && chunk_truthy {
                 let last_bound = last.bind(py);
-                let last_char =
-                    last_bound.get_item(-1i64)?;
-                let chunk_char =
-                    chunk_bound.get_item(-1i64)?;
+                let last_char = last_bound.get_item(-1i64)?;
+                let chunk_char = chunk_bound.get_item(-1i64)?;
                 last_char.eq(&chunk_char)?
             } else {
                 false
