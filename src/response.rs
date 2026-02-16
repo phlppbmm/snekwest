@@ -53,17 +53,20 @@ impl StreamingBody {
         let Some(mut response) = response_opt else {
             return Ok(Vec::new());
         };
-        let (response_back, data) = py.allow_threads(move || {
+        let (response_back, result) = py.allow_threads(move || {
             let mut buf = vec![0u8; size];
             match response.read(&mut buf) {
-                Ok(0) => (response, Vec::new()),
+                Ok(0) => (response, Ok(Vec::new())),
                 Ok(n) => {
                     buf.truncate(n);
-                    (response, buf)
+                    (response, Ok(buf))
                 }
-                Err(_) => (response, Vec::new()),
+                Err(e) => (response, Err(e)),
             }
         });
+        let data = result.map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("Stream read error: {}", e))
+        })?;
         let mut guard = self.inner.0.lock().map_err(|e| {
             PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
         })?;
@@ -627,7 +630,7 @@ impl Response {
 
     #[getter]
     fn ok(&mut self, py: Python<'_>) -> PyResult<bool> {
-        match self.raise_for_status_impl(py) {
+        match self.raise_for_status_impl(py, None) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -777,8 +780,9 @@ impl Response {
         }
     }
 
-    fn raise_for_status(&mut self, py: Python<'_>) -> PyResult<()> {
-        self.raise_for_status_impl(py)
+    fn raise_for_status(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        let this = slf.borrow();
+        this.raise_for_status_impl(py, Some(slf.as_any().clone().unbind()))
     }
 
     #[pyo3(signature = (chunk_size=1, decode_unicode=false))]
@@ -910,7 +914,7 @@ impl Response {
 }
 
 impl Response {
-    fn raise_for_status_impl(&self, py: Python<'_>) -> PyResult<()> {
+    fn raise_for_status_impl(&self, py: Python<'_>, response_obj: Option<Py<PyAny>>) -> PyResult<()> {
         let status = self.status_code.unwrap_or(0);
 
         let reason: String = match &self.reason_inner {
@@ -951,9 +955,7 @@ impl Response {
                 .import("snekwest.exceptions")?
                 .getattr("HTTPError")?;
             let kwargs = PyDict::new(py);
-            // Pass self as response - we need a Py<PyAny> but we have &self
-            // Use None for now; the caller (Python) can set it
-            kwargs.set_item("response", py.None())?;
+            kwargs.set_item("response", response_obj.as_ref().map_or_else(|| py.None(), |r| r.clone_ref(py)))?;
             return Err(PyErr::from_value(
                 http_error_cls.call((error_msg,), Some(&kwargs))?,
             ));

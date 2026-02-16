@@ -34,7 +34,6 @@ from ._internal_utils import (  # noqa: F401
 from .compat import (
     Mapping,
     basestring,
-    bytes,
     getproxies,
     getproxies_environment,
     integer_types,
@@ -45,7 +44,6 @@ from .compat import (
     proxy_bypass,
     proxy_bypass_environment,
     quote,
-    str,
     unquote,
     urlparse,
     urlunparse,
@@ -691,30 +689,7 @@ def get_environ_proxies(url, no_proxy=None):
         return getproxies()
 
 
-def select_proxy(url, proxies):
-    """Select a proxy for the url, if applicable.
-
-    :param url: The url being for the request
-    :param proxies: A dictionary of schemes or schemes and hosts to proxy URLs
-    """
-    proxies = proxies or {}
-    urlparts = urlparse(url)
-    if urlparts.hostname is None:
-        return proxies.get(urlparts.scheme, proxies.get("all"))
-
-    proxy_keys = [
-        urlparts.scheme + "://" + urlparts.hostname,
-        urlparts.scheme,
-        "all://" + urlparts.hostname,
-        "all",
-    ]
-    proxy = None
-    for proxy_key in proxy_keys:
-        if proxy_key in proxies:
-            proxy = proxies[proxy_key]
-            break
-
-    return proxy
+# select_proxy is now imported from Rust (_bindings) above.
 
 
 def resolve_proxies(request, proxies, trust_env=True):
@@ -773,31 +748,7 @@ def default_headers():
 # guess_json_utf is now imported from Rust (_bindings) above.
 
 
-def prepend_scheme_if_needed(url, new_scheme):
-    """Given a URL that may or may not have a scheme, prepend the given scheme.
-    Does not replace a present scheme with the one provided as an argument.
-
-    :rtype: str
-    """
-    from urllib3.util.url import parse_url
-
-    parsed = parse_url(url)
-    scheme, auth, host, port, path, query, fragment = parsed
-
-    netloc = parsed.netloc
-    if not netloc:
-        netloc, path = path, netloc
-
-    if auth:
-        # parse_url doesn't provide the netloc with auth
-        # so we'll add it ourselves.
-        netloc = "@".join([auth, netloc])
-    if scheme is None:
-        scheme = new_scheme
-    if path is None:
-        path = ""
-
-    return _stdlib_urlunparse((scheme, netloc or "", path, "", query or "", fragment or ""))
+# prepend_scheme_if_needed is now imported from Rust (_bindings) above.
 
 
 # get_auth_from_url is now imported from Rust (_bindings) above.
@@ -833,21 +784,7 @@ def _validate_header_part(header, header_part, header_validator_index):
         )
 
 
-def urldefragauth(url):
-    """
-    Given a url remove the fragment and the authentication part.
-
-    :rtype: str
-    """
-    scheme, netloc, path, params, query, fragment = urlparse(url)
-
-    # see func:`prepend_scheme_if_needed`
-    if not netloc:
-        netloc, path = path, netloc
-
-    netloc = netloc.rsplit("@", 1)[-1]
-
-    return urlunparse((scheme, netloc, path, params, query, ""))
+# urldefragauth is now imported from Rust (_bindings) above.
 
 
 def rewind_body(prepared_request):

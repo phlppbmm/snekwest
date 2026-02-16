@@ -18,26 +18,66 @@ fn reason_phrase(status: u16) -> Option<String> {
     let phrase = match status {
         100 => "Continue",
         101 => "Switching Protocols",
+        102 => "Processing",
+        103 => "Early Hints",
         200 => "OK",
         201 => "Created",
         202 => "Accepted",
+        203 => "Non-Authoritative Information",
         204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        207 => "Multi-Status",
+        208 => "Already Reported",
+        226 => "IM Used",
+        300 => "Multiple Choices",
         301 => "Moved Permanently",
         302 => "Found",
         303 => "See Other",
         304 => "Not Modified",
+        305 => "Use Proxy",
         307 => "Temporary Redirect",
         308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
+        402 => "Payment Required",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
         408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
+        413 => "Content Too Large",
+        414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
+        418 => "I'm a Teapot",
+        421 => "Misdirected Request",
+        422 => "Unprocessable Content",
+        423 => "Locked",
+        424 => "Failed Dependency",
+        425 => "Too Early",
+        426 => "Upgrade Required",
+        428 => "Precondition Required",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        451 => "Unavailable For Legal Reasons",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        506 => "Variant Also Negotiates",
+        507 => "Insufficient Storage",
+        508 => "Loop Detected",
+        510 => "Not Extended",
+        511 => "Network Authentication Required",
         _ => return None,
     };
     Some(phrase.to_string())
@@ -460,7 +500,7 @@ pub struct Session {
 impl Session {
     fn get_or_create_client(&self, params: &RequestParams) -> PyResult<Arc<Client>> {
         let config = ClientConfig::from_params(params);
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(existing_client) = clients.get(&config) {
             return Ok(existing_client.clone());
@@ -473,7 +513,7 @@ impl Session {
 
     fn merge_cookies(&self, params: &RequestParams) -> HashMap<String, String> {
         let mut all_cookies = {
-            let session_cookies = self.cookie_jar.lock().unwrap();
+            let session_cookies = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
             session_cookies.clone()
         };
 
@@ -615,7 +655,7 @@ impl Session {
             return;
         }
 
-        let mut jar = self.cookie_jar.lock().unwrap();
+        let mut jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
 
         for (name, value) in response.headers() {
             if name.as_str().to_lowercase() == "set-cookie" {
@@ -802,7 +842,7 @@ impl Session {
         // Release the GIL so Python-based servers (httpbin etc.) can process
         Python::attach(|py| {
             py.detach(|| {
-                request.send().map_err(|e| e)
+                request.send()
             })
             .map_err(|e| map_reqwest_error(py, e, had_explicit_connect_timeout, has_proxies))
         })
@@ -1226,9 +1266,9 @@ impl Session {
             }
         }
         // Clear internal state
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         clients.clear();
-        let mut cookies = self.cookie_jar.lock().unwrap();
+        let mut cookies = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
         cookies.clear();
         Ok(())
     }
@@ -1280,22 +1320,22 @@ impl Session {
     }
 
     fn get_cookies_internal(&self) -> HashMap<String, String> {
-        let jar = self.cookie_jar.lock().unwrap();
+        let jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
         jar.clone()
     }
 
     fn set_cookies_internal(&self, cookies: HashMap<String, String>) {
-        let mut jar = self.cookie_jar.lock().unwrap();
+        let mut jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
         jar.extend(cookies);
     }
 
     fn set_cookie_internal(&self, key: String, value: String) {
-        let mut jar = self.cookie_jar.lock().unwrap();
+        let mut jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
         jar.insert(key, value);
     }
 
     fn remove_cookie_internal(&self, key: &str) {
-        let mut jar = self.cookie_jar.lock().unwrap();
+        let mut jar = self.cookie_jar.lock().unwrap_or_else(|e| e.into_inner());
         jar.remove(key);
     }
 

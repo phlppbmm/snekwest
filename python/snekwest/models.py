@@ -10,7 +10,8 @@ import encodings.idna  # noqa: F401
 from io import BytesIO, UnsupportedOperation
 from urllib.parse import urlparse as _urlparse, urlsplit as _urlsplit
 
-from ._internal_utils import to_native_string, unicode_is_ascii
+from ._internal_utils import to_native_string
+from .utils import unicode_is_ascii
 from .auth import HTTPBasicAuth
 from .compat import (
     Callable,
