@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict};
 use pythonize::depythonize;
 use reqwest::blocking::{Client, ClientBuilder};
+use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -246,15 +247,22 @@ fn repr_str(s: &str) -> String {
 /// This avoids false positives from URLs containing "ssl" in the path.
 fn is_ssl_error(e: &reqwest::Error) -> bool {
     use std::error::Error;
-    // Skip the top-level reqwest error (which contains the URL) and check sources
     let mut source: Option<&dyn Error> = e.source();
     while let Some(s) = source {
+        // Type-safe detection: any rustls::Error is definitively an SSL error
+        if s.downcast_ref::<rustls::Error>().is_some() {
+            return true;
+        }
+        // String fallback for other TLS backends or wrapped errors
         let msg = s.to_string().to_lowercase();
         if msg.contains("certificate")
             || msg.contains("handshake")
             || msg.contains("unknown issuer")
             || msg.contains("self signed")
+            || msg.contains("self-signed")
             || msg.contains("alertreceived")
+            || msg.contains("expired")
+            || msg.contains("revoked")
         {
             return true;
         }
@@ -470,7 +478,7 @@ fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
 #[pyclass(subclass, dict)]
 pub struct Session {
     // Internal transport state (used by make_request/do_request chain)
-    clients: Mutex<HashMap<ClientConfig, Arc<Client>>>,
+    clients: Mutex<IndexMap<ClientConfig, Arc<Client>>>,
     // Python-facing session attributes
     #[pyo3(get, set)]
     pub headers: Py<PyAny>,
@@ -500,6 +508,8 @@ pub struct Session {
 
 impl Session {
     fn get_or_create_client(&self, params: &RequestParams) -> PyResult<Arc<Client>> {
+        const MAX_CACHED_CLIENTS: usize = 8;
+
         let config = ClientConfig::from_params(params);
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -508,6 +518,12 @@ impl Session {
         }
 
         let new_client = self.create_client_for_config(&config)?;
+
+        // FIFO eviction: remove oldest entry when cache is full
+        while clients.len() >= MAX_CACHED_CLIENTS {
+            clients.shift_remove_index(0);
+        }
+
         clients.insert(config, new_client.clone());
         Ok(new_client)
     }
@@ -896,7 +912,7 @@ impl Session {
         let py_adapters = adapters_cls.call0()?.unbind();
 
         Ok(Session {
-            clients: Mutex::new(HashMap::new()),
+            clients: Mutex::new(IndexMap::new()),
             headers: py_headers,
             cookies: py_cookies,
             auth: py.None(),
@@ -1593,5 +1609,148 @@ impl Session {
             let _ = r.getattr("content")?;
         }
         Ok(r.unbind())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- reason_phrase tests --
+
+    #[test]
+    fn test_reason_phrase_common_codes() {
+        assert_eq!(reason_phrase(200), Some("OK".to_string()));
+        assert_eq!(reason_phrase(404), Some("Not Found".to_string()));
+        assert_eq!(reason_phrase(500), Some("Internal Server Error".to_string()));
+        assert_eq!(reason_phrase(301), Some("Moved Permanently".to_string()));
+        assert_eq!(reason_phrase(302), Some("Found".to_string()));
+    }
+
+    #[test]
+    fn test_reason_phrase_unknown_code() {
+        assert_eq!(reason_phrase(999), None);
+        assert_eq!(reason_phrase(0), None);
+        assert_eq!(reason_phrase(600), None);
+    }
+
+    #[test]
+    fn test_reason_phrase_all_redirect_codes() {
+        assert_eq!(reason_phrase(301), Some("Moved Permanently".to_string()));
+        assert_eq!(reason_phrase(302), Some("Found".to_string()));
+        assert_eq!(reason_phrase(303), Some("See Other".to_string()));
+        assert_eq!(reason_phrase(307), Some("Temporary Redirect".to_string()));
+        assert_eq!(reason_phrase(308), Some("Permanent Redirect".to_string()));
+    }
+
+    // -- is_redirect_status tests --
+
+    #[test]
+    fn test_is_redirect_status_true() {
+        assert!(is_redirect_status(301));
+        assert!(is_redirect_status(302));
+        assert!(is_redirect_status(303));
+        assert!(is_redirect_status(307));
+        assert!(is_redirect_status(308));
+    }
+
+    #[test]
+    fn test_is_redirect_status_false() {
+        assert!(!is_redirect_status(200));
+        assert!(!is_redirect_status(304)); // Not Modified is NOT a redirect
+        assert!(!is_redirect_status(400));
+        assert!(!is_redirect_status(404));
+        assert!(!is_redirect_status(500));
+        assert!(!is_redirect_status(0));
+    }
+
+    // -- should_strip_auth tests --
+
+    #[test]
+    fn test_strip_auth_same_host_same_scheme() {
+        // Same host, same scheme → don't strip
+        assert!(!should_strip_auth(
+            "http://example.com/a",
+            "http://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_different_host() {
+        // Different host → always strip
+        assert!(should_strip_auth(
+            "http://example.com/a",
+            "http://other.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_http_to_https_default_ports() {
+        // HTTP→HTTPS on default ports → safe upgrade, don't strip
+        assert!(!should_strip_auth(
+            "http://example.com/a",
+            "https://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_https_to_http() {
+        // HTTPS→HTTP downgrade → strip
+        assert!(should_strip_auth(
+            "https://example.com/a",
+            "http://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_port_change() {
+        // Same host, different port → strip
+        assert!(should_strip_auth(
+            "http://example.com:8080/a",
+            "http://example.com:9090/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_explicit_default_port_to_implicit() {
+        // http://host:80 → http://host (both are port 80) → don't strip
+        assert!(!should_strip_auth(
+            "http://example.com:80/a",
+            "http://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_explicit_non_default_port() {
+        // http://host:8080 → http://host (80 vs 8080) → strip
+        assert!(should_strip_auth(
+            "http://example.com:8080/a",
+            "http://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_invalid_url() {
+        // Invalid URLs → don't strip (parse fails, returns false)
+        assert!(!should_strip_auth("not a url", "http://example.com"));
+        assert!(!should_strip_auth("http://example.com", "not a url"));
+    }
+
+    #[test]
+    fn test_strip_auth_https_explicit_443_to_implicit() {
+        // https://host:443 → https://host (both are 443) → don't strip
+        assert!(!should_strip_auth(
+            "https://example.com:443/a",
+            "https://example.com/b"
+        ));
+    }
+
+    #[test]
+    fn test_strip_auth_http_to_https_non_default_ports() {
+        // http://host:8080 → https://host:8443 → strip (scheme + port change)
+        assert!(should_strip_auth(
+            "http://example.com:8080/a",
+            "https://example.com:8443/b"
+        ));
     }
 }
