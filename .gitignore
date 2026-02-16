@@ -11,3 +11,6 @@ wheels/
 
 target
 *.so
+*.pyd
+.claude
+VISION.md
