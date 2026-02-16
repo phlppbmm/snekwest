@@ -95,7 +95,7 @@ impl StreamingBody {
 pub struct RawResponseData {
     pub status: u16,
     pub url: String,
-    pub headers: HashMap<String, String>,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub elapsed_ms: f64,
     pub history: Vec<RawResponseData>,
@@ -106,7 +106,7 @@ pub struct RawResponseData {
     pub request_url: String,
     pub request_headers: HashMap<String, String>,
     pub streaming_inner: Option<StreamingInner>,
-    pub streaming_headers: Option<HashMap<String, String>>,
+    pub streaming_headers: Option<Vec<(String, String)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,11 +199,13 @@ impl Response {
         let (content_bytes, content_loaded, content_consumed, raw) =
             if let Some(streaming) = data.streaming_inner {
                 // Streaming: wrap in StreamingRawResponse
+                let streaming_hdrs_map: HashMap<String, String> =
+                    data.streaming_headers.unwrap_or_default().into_iter().collect();
                 let sb = Py::new(
                     py,
                     StreamingBody::new(
                         streaming,
-                        data.streaming_headers.unwrap_or_default(),
+                        streaming_hdrs_map,
                     ),
                 )?;
                 let streaming_cls = py

@@ -693,7 +693,7 @@ impl Session {
 
     fn extract_response_headers(
         response: &reqwest::blocking::Response,
-    ) -> HashMap<String, String> {
+    ) -> Vec<(String, String)> {
         response
             .headers()
             .iter()
