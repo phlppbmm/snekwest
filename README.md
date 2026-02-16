@@ -67,7 +67,7 @@ Snekwest follows a structured milestone versioning strategy inspired by semantic
 Contributions are welcome! Whether you're fixing bugs, adding features, improving documentation, or reporting issues, we'd love to have your help.
 
 **Ways to contribute:**
-- 🐛 Report bugs or request features via [GitHub Issues](https://github.com/your-username/snekwest/issues)
+- 🐛 Report bugs or request features via [GitHub Issues](https://github.com/phlppbmm/snekwest/issues)
 - 🔧 Submit pull requests for bug fixes or new features
 - 📚 Improve documentation or add examples
 - 🧪 Write tests to improve coverage
