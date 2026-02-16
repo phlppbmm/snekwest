@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict};
 use pythonize::depythonize;
 use reqwest::blocking::{Client, ClientBuilder};
+use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -477,7 +478,7 @@ fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
 #[pyclass(subclass, dict)]
 pub struct Session {
     // Internal transport state (used by make_request/do_request chain)
-    clients: Mutex<HashMap<ClientConfig, Arc<Client>>>,
+    clients: Mutex<IndexMap<ClientConfig, Arc<Client>>>,
     // Python-facing session attributes
     #[pyo3(get, set)]
     pub headers: Py<PyAny>,
@@ -507,6 +508,8 @@ pub struct Session {
 
 impl Session {
     fn get_or_create_client(&self, params: &RequestParams) -> PyResult<Arc<Client>> {
+        const MAX_CACHED_CLIENTS: usize = 8;
+
         let config = ClientConfig::from_params(params);
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -515,6 +518,12 @@ impl Session {
         }
 
         let new_client = self.create_client_for_config(&config)?;
+
+        // FIFO eviction: remove oldest entry when cache is full
+        while clients.len() >= MAX_CACHED_CLIENTS {
+            clients.shift_remove_index(0);
+        }
+
         clients.insert(config, new_client.clone());
         Ok(new_client)
     }
@@ -903,7 +912,7 @@ impl Session {
         let py_adapters = adapters_cls.call0()?.unbind();
 
         Ok(Session {
-            clients: Mutex::new(HashMap::new()),
+            clients: Mutex::new(IndexMap::new()),
             headers: py_headers,
             cookies: py_cookies,
             auth: py.None(),
