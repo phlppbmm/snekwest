@@ -468,7 +468,7 @@ fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
 #[pyclass(subclass, dict)]
 pub struct Session {
     // Internal transport state (used by make_request/do_request chain)
-    clients: Mutex<HashMap<ClientConfig, Arc<Client>>>,
+    clients: Mutex<indexmap::IndexMap<ClientConfig, Arc<Client>>>,
     cookie_jar: Mutex<HashMap<String, String>>,
     // Python-facing session attributes
     #[pyo3(get, set)]
@@ -497,6 +497,10 @@ pub struct Session {
     pub adapters: Py<PyAny>,
 }
 
+/// Maximum number of cached reqwest::Client instances per Session.
+/// Most sessions use 1-2 configs; 8 is generous for varied proxy/cert setups.
+const MAX_CACHED_CLIENTS: usize = 8;
+
 impl Session {
     fn get_or_create_client(&self, params: &RequestParams) -> PyResult<Arc<Client>> {
         let config = ClientConfig::from_params(params);
@@ -507,6 +511,10 @@ impl Session {
         }
 
         let new_client = self.create_client_for_config(&config)?;
+        // Evict least recently used entry if cache is full
+        if clients.len() >= MAX_CACHED_CLIENTS {
+            clients.shift_remove_index(0);
+        }
         clients.insert(config, new_client.clone());
         Ok(new_client)
     }
@@ -1165,7 +1173,7 @@ impl Session {
         let py_adapters = adapters_cls.call0()?.unbind();
 
         Ok(Session {
-            clients: Mutex::new(HashMap::new()),
+            clients: Mutex::new(indexmap::IndexMap::new()),
             cookie_jar: Mutex::new(HashMap::new()),
             headers: py_headers,
             cookies: py_cookies,
