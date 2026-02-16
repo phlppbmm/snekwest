@@ -447,7 +447,105 @@ pub fn select_proxy(
 }
 
 // ============================================================================
-// 2f: Header validation (check_header_validity)
+// 2f: HTTP list/dict header parsing
+// ============================================================================
+
+/// Parse RFC 2068 comma-separated lists with quoted-string support.
+/// Equivalent to urllib.request.parse_http_list.
+fn parse_http_list(s: &str) -> Vec<String> {
+    let mut res = Vec::new();
+    let mut part = String::new();
+    let mut escape = false;
+    let mut quote = false;
+
+    for cur in s.chars() {
+        if escape {
+            part.push(cur);
+            escape = false;
+            continue;
+        }
+        if quote {
+            if cur == '\\' {
+                escape = true;
+                continue;
+            } else if cur == '"' {
+                quote = false;
+            }
+            part.push(cur);
+            continue;
+        }
+        if cur == ',' {
+            res.push(part.clone());
+            part.clear();
+            continue;
+        }
+        if cur == '"' {
+            quote = true;
+        }
+        part.push(cur);
+    }
+    if !part.is_empty() {
+        res.push(part);
+    }
+    res.into_iter().map(|p| p.trim().to_string()).collect()
+}
+
+/// Unquote a header value — reversal of quote_header_value.
+/// This is what browsers actually use for quoting, not full RFC unquoting.
+fn unquote_header_value_inner(value: &str, is_filename: bool) -> String {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let inner = &value[1..value.len() - 1];
+        if !is_filename || !inner.starts_with("\\\\") {
+            return inner.replace("\\\\", "\\").replace("\\\"", "\"");
+        }
+        return inner.to_string();
+    }
+    value.to_string()
+}
+
+/// Parse a list header value (RFC 2068 Section 2).
+#[pyfunction]
+pub fn parse_list_header(value: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for item in parse_http_list(value) {
+        if item.len() >= 2 && item.starts_with('"') && item.ends_with('"') {
+            result.push(unquote_header_value_inner(&item[1..item.len() - 1], false));
+        } else {
+            result.push(item);
+        }
+    }
+    result
+}
+
+/// Parse a dict header value (RFC 2068 Section 2).
+#[pyfunction]
+pub fn parse_dict_header(py: Python<'_>, value: &str) -> PyResult<Py<pyo3::types::PyDict>> {
+    let dict = pyo3::types::PyDict::new(py);
+    for item in parse_http_list(value) {
+        if let Some(eq_pos) = item.find('=') {
+            let name = &item[..eq_pos];
+            let val = &item[eq_pos + 1..];
+            if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
+                dict.set_item(name, unquote_header_value_inner(&val[1..val.len() - 1], false))?;
+            } else {
+                dict.set_item(name, val)?;
+            }
+        } else {
+            dict.set_item(&item, py.None())?;
+        }
+    }
+    Ok(dict.unbind())
+}
+
+/// Unquote a header value.
+#[pyfunction]
+#[pyo3(signature = (value, is_filename=false))]
+pub fn unquote_header_value(value: &str, is_filename: bool) -> String {
+    unquote_header_value_inner(value, is_filename)
+}
+
+// ============================================================================
+// 2g: Header validation (check_header_validity)
 // ============================================================================
 
 /// Validate a header name (str).
@@ -942,5 +1040,72 @@ mod tests {
         assert!(!is_valid_header_value_bytes(b"\tbad"));
         assert!(!is_valid_header_value_bytes(b"bad\rvalue"));
         assert!(!is_valid_header_value_bytes(b"bad\nvalue"));
+    }
+
+    // -- HTTP list/dict header parsing tests --
+
+    #[test]
+    fn test_parse_http_list_simple() {
+        let result = parse_http_list("foo, bar, baz");
+        assert_eq!(result, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn test_parse_http_list_quoted() {
+        let result = parse_http_list(r#"foo, "bar, baz", qux"#);
+        assert_eq!(result, vec!["foo", "\"bar, baz\"", "qux"]);
+    }
+
+    #[test]
+    fn test_parse_http_list_escaped() {
+        let result = parse_http_list(r#""val with \"escaped\" quotes""#);
+        assert_eq!(result, vec![r#""val with "escaped" quotes""#]);
+    }
+
+    #[test]
+    fn test_parse_http_list_empty() {
+        let result = parse_http_list("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_unquote_header_value_quoted() {
+        assert_eq!(unquote_header_value_inner(r#""hello""#, false), "hello");
+    }
+
+    #[test]
+    fn test_unquote_header_value_escaped_backslash() {
+        assert_eq!(unquote_header_value_inner(r#""hello\\world""#, false), "hello\\world");
+    }
+
+    #[test]
+    fn test_unquote_header_value_escaped_quote() {
+        assert_eq!(unquote_header_value_inner(r#""hello\"world""#, false), r#"hello"world"#);
+    }
+
+    #[test]
+    fn test_unquote_header_value_unquoted() {
+        assert_eq!(unquote_header_value_inner("hello", false), "hello");
+    }
+
+    #[test]
+    fn test_unquote_header_value_filename_unc() {
+        // UNC path should not have backslashes unescaped
+        assert_eq!(
+            unquote_header_value_inner(r#""\\\\server\\share""#, true),
+            r#"\\\\server\\share"#
+        );
+    }
+
+    #[test]
+    fn test_parse_list_header() {
+        let result = parse_list_header("token, \"quoted value\"");
+        assert_eq!(result, vec!["token", "quoted value"]);
+    }
+
+    #[test]
+    fn test_parse_list_header_empty() {
+        let result = parse_list_header("");
+        assert!(result.is_empty());
     }
 }

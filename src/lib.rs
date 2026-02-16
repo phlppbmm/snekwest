@@ -41,5 +41,8 @@ fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(utils::select_proxy, m)?)?;
     m.add_function(wrap_pyfunction!(utils::check_header_validity, m)?)?;
     m.add_function(wrap_pyfunction!(utils::to_native_string, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::parse_list_header, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::parse_dict_header, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::unquote_header_value, m)?)?;
     Ok(())
 }
