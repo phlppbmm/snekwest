@@ -447,6 +447,192 @@ pub fn select_proxy(
 }
 
 // ============================================================================
+// 2f: Header validation (check_header_validity)
+// ============================================================================
+
+/// Validate a header name (str).
+/// Pattern: `^[^:\s][^:\r\n]*$`
+fn is_valid_header_name_str(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    let first = bytes[0];
+    // First char must not be ':' or whitespace
+    if first == b':' || first.is_ascii_whitespace() {
+        return false;
+    }
+    // Rest must not contain ':', '\r', '\n'
+    for &b in &bytes[1..] {
+        if b == b':' || b == b'\r' || b == b'\n' {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate a header name (bytes).
+/// Pattern: `^[^:\s][^:\r\n]*$`
+fn is_valid_header_name_bytes(name: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let first = name[0];
+    if first == b':' || first.is_ascii_whitespace() {
+        return false;
+    }
+    for &b in &name[1..] {
+        if b == b':' || b == b'\r' || b == b'\n' {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate a header value (str).
+/// Pattern: `^\S[^\r\n]*$|^$`
+fn is_valid_header_value_str(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    // First char must not be whitespace
+    if bytes[0].is_ascii_whitespace() {
+        return false;
+    }
+    // Rest must not contain '\r' or '\n'
+    for &b in &bytes[1..] {
+        if b == b'\r' || b == b'\n' {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate a header value (bytes).
+/// Pattern: `^\S[^\r\n]*$|^$`
+fn is_valid_header_value_bytes(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if value[0].is_ascii_whitespace() {
+        return false;
+    }
+    for &b in &value[1..] {
+        if b == b'\r' || b == b'\n' {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate a header (name, value) tuple from Rust code.
+/// Returns Ok(()) or Err(PyErr) with InvalidHeader.
+pub fn check_header_validity_rust(
+    py: Python<'_>,
+    name: &Bound<'_, PyAny>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    // Validate name
+    if let Ok(s) = name.extract::<String>() {
+        if !is_valid_header_name_str(&s) {
+            return Err(crate::exceptions::make_exception(
+                py,
+                "InvalidHeader",
+                format!(
+                    "Invalid leading whitespace, reserved character(s), or return character(s) in header name: {:?}",
+                    s
+                ),
+            ));
+        }
+    } else if let Ok(b) = name.extract::<Vec<u8>>() {
+        if !is_valid_header_name_bytes(&b) {
+            return Err(crate::exceptions::make_exception(
+                py,
+                "InvalidHeader",
+                format!(
+                    "Invalid leading whitespace, reserved character(s), or return character(s) in header name: {:?}",
+                    b
+                ),
+            ));
+        }
+    } else {
+        return Err(crate::exceptions::make_exception(
+            py,
+            "InvalidHeader",
+            format!(
+                "Header part ({}) from ({}, {}) must be of type str or bytes, not {}",
+                name, name, value,
+                name.get_type().name()?
+            ),
+        ));
+    }
+
+    // Validate value
+    if let Ok(s) = value.extract::<String>() {
+        if !is_valid_header_value_str(&s) {
+            return Err(crate::exceptions::make_exception(
+                py,
+                "InvalidHeader",
+                format!(
+                    "Invalid leading whitespace, reserved character(s), or return character(s) in header value: {:?}",
+                    s
+                ),
+            ));
+        }
+    } else if let Ok(b) = value.extract::<Vec<u8>>() {
+        if !is_valid_header_value_bytes(&b) {
+            return Err(crate::exceptions::make_exception(
+                py,
+                "InvalidHeader",
+                format!(
+                    "Invalid leading whitespace, reserved character(s), or return character(s) in header value: {:?}",
+                    b
+                ),
+            ));
+        }
+    } else {
+        return Err(crate::exceptions::make_exception(
+            py,
+            "InvalidHeader",
+            format!(
+                "Header part ({}) from ({}, {}) must be of type str or bytes, not {}",
+                value, name, value,
+                value.get_type().name()?
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Python-callable check_header_validity(header) where header is a (name, value) tuple.
+#[pyfunction]
+pub fn check_header_validity(py: Python<'_>, header: &Bound<'_, PyAny>) -> PyResult<()> {
+    let name = header.get_item(0)?;
+    let value = header.get_item(1)?;
+    check_header_validity_rust(py, &name, &value)
+}
+
+// ============================================================================
+// 2g: to_native_string
+// ============================================================================
+
+/// Given a string object (str or bytes), return a native str.
+/// Equivalent to Python's to_native_string(string, encoding='ascii').
+#[pyfunction]
+#[pyo3(signature = (string, encoding="ascii"))]
+pub fn to_native_string(_py: Python<'_>, string: &Bound<'_, PyAny>, encoding: &str) -> PyResult<String> {
+    if let Ok(s) = string.extract::<String>() {
+        Ok(s)
+    } else {
+        // Call bytes.decode(encoding) — same as Python implementation
+        let decoded = string.call_method1("decode", (encoding,))?;
+        decoded.extract::<String>()
+    }
+}
+
+// ============================================================================
 // Rust-only unit tests (Group C)
 // ============================================================================
 
@@ -674,5 +860,87 @@ mod tests {
             select_proxy("http://example.com", Some(HashMap::new())),
             None
         );
+    }
+
+    // -- Header validation tests --
+
+    #[test]
+    fn test_valid_header_name_str() {
+        assert!(is_valid_header_name_str("Content-Type"));
+        assert!(is_valid_header_name_str("X-Custom-Header"));
+        assert!(is_valid_header_name_str("Accept"));
+        assert!(is_valid_header_name_str("a"));
+    }
+
+    #[test]
+    fn test_invalid_header_name_str() {
+        // Empty
+        assert!(!is_valid_header_name_str(""));
+        // Starts with colon
+        assert!(!is_valid_header_name_str(":bad"));
+        // Starts with space
+        assert!(!is_valid_header_name_str(" bad"));
+        // Starts with tab
+        assert!(!is_valid_header_name_str("\tbad"));
+        // Contains colon
+        assert!(!is_valid_header_name_str("bad:header"));
+        // Contains \r
+        assert!(!is_valid_header_name_str("bad\rheader"));
+        // Contains \n
+        assert!(!is_valid_header_name_str("bad\nheader"));
+    }
+
+    #[test]
+    fn test_valid_header_name_bytes() {
+        assert!(is_valid_header_name_bytes(b"Content-Type"));
+        assert!(is_valid_header_name_bytes(b"X-Custom"));
+        assert!(is_valid_header_name_bytes(b"a"));
+    }
+
+    #[test]
+    fn test_invalid_header_name_bytes() {
+        assert!(!is_valid_header_name_bytes(b""));
+        assert!(!is_valid_header_name_bytes(b":bad"));
+        assert!(!is_valid_header_name_bytes(b" bad"));
+        assert!(!is_valid_header_name_bytes(b"bad:header"));
+        assert!(!is_valid_header_name_bytes(b"bad\rheader"));
+        assert!(!is_valid_header_name_bytes(b"bad\nheader"));
+    }
+
+    #[test]
+    fn test_valid_header_value_str() {
+        assert!(is_valid_header_value_str("application/json"));
+        assert!(is_valid_header_value_str("text/html; charset=utf-8"));
+        // Empty is valid
+        assert!(is_valid_header_value_str(""));
+        // Value with internal spaces is fine
+        assert!(is_valid_header_value_str("hello world"));
+    }
+
+    #[test]
+    fn test_invalid_header_value_str() {
+        // Starts with space
+        assert!(!is_valid_header_value_str(" bad"));
+        // Starts with tab
+        assert!(!is_valid_header_value_str("\tbad"));
+        // Contains \r
+        assert!(!is_valid_header_value_str("bad\rvalue"));
+        // Contains \n
+        assert!(!is_valid_header_value_str("bad\nvalue"));
+    }
+
+    #[test]
+    fn test_valid_header_value_bytes() {
+        assert!(is_valid_header_value_bytes(b"application/json"));
+        assert!(is_valid_header_value_bytes(b""));
+        assert!(is_valid_header_value_bytes(b"hello world"));
+    }
+
+    #[test]
+    fn test_invalid_header_value_bytes() {
+        assert!(!is_valid_header_value_bytes(b" bad"));
+        assert!(!is_valid_header_value_bytes(b"\tbad"));
+        assert!(!is_valid_header_value_bytes(b"bad\rvalue"));
+        assert!(!is_valid_header_value_bytes(b"bad\nvalue"));
     }
 }

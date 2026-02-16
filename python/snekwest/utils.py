@@ -74,6 +74,8 @@ from ._bindings import (  # noqa: F811, E402
     _parse_content_type_header,
     guess_json_utf,
     select_proxy,
+    check_header_validity,
+    to_native_string as _rust_to_native_string,
 )
 
 NETRC_FILES = (".netrc", "_netrc")
@@ -754,35 +756,7 @@ def default_headers():
 # get_auth_from_url is now imported from Rust (_bindings) above.
 
 
-def check_header_validity(header):
-    """Verifies that header parts don't contain leading whitespace
-    reserved characters, or return characters.
-
-    :param header: tuple, in the format (name, value).
-    """
-    name, value = header
-    _validate_header_part(header, name, 0)
-    _validate_header_part(header, value, 1)
-
-
-def _validate_header_part(header, header_part, header_validator_index):
-    if isinstance(header_part, str):
-        validator = _HEADER_VALIDATORS_STR[header_validator_index]
-    elif isinstance(header_part, bytes):
-        validator = _HEADER_VALIDATORS_BYTE[header_validator_index]
-    else:
-        raise InvalidHeader(
-            f"Header part ({header_part!r}) from {header} "
-            f"must be of type str or bytes, not {type(header_part)}"
-        )
-
-    if not validator.match(header_part):
-        header_kind = "name" if header_validator_index == 0 else "value"
-        raise InvalidHeader(
-            f"Invalid leading whitespace, reserved character(s), or return "
-            f"character(s) in header {header_kind}: {header_part!r}"
-        )
-
+# check_header_validity is now imported from Rust (_bindings) above.
 
 # urldefragauth is now imported from Rust (_bindings) above.
 

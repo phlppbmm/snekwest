@@ -584,22 +584,29 @@ impl PreparedRequest {
         if let Some(hdrs) = headers {
             if !hdrs.is_none() {
                 let items = hdrs.call_method0("items")?;
-                let check_header_validity = py
-                    .import("snekwest.utils")?
-                    .getattr("check_header_validity")?;
-                let to_native_string = py
-                    .import("snekwest._internal_utils")?
-                    .getattr("to_native_string")?;
 
                 for item in items.try_iter()? {
                     let item = item?;
-                    // Check validity
-                    check_header_validity.call1((&item,))?;
-
                     let name = item.get_item(0)?;
                     let value = item.get_item(1)?;
-                    let native_name: String =
-                        to_native_string.call1((&name,))?.extract()?;
+
+                    // Check validity (pure Rust, no Python call)
+                    crate::utils::check_header_validity_rust(py, &name, &value)?;
+
+                    // Convert name to native string (pure Rust for str, fallback for bytes)
+                    let native_name: String = if let Ok(s) = name.extract::<String>() {
+                        s
+                    } else if let Ok(b) = name.extract::<Vec<u8>>() {
+                        String::from_utf8(b).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(
+                                format!("Header name is not valid ASCII: {}", e)
+                            )
+                        })?
+                    } else {
+                        return Err(pyo3::exceptions::PyTypeError::new_err(
+                            "Header name must be str or bytes"
+                        ));
+                    };
 
                     let headers_ref = self.headers_inner.as_ref().unwrap();
                     headers_ref

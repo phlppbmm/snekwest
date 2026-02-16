@@ -21,19 +21,5 @@ HEADER_VALIDATORS = {
 }
 
 
-def to_native_string(string, encoding="ascii"):
-    """Given a string object, regardless of type, returns a representation of
-    that string in the native string type, encoding and decoding where
-    necessary. This assumes ASCII unless told otherwise.
-    """
-    if isinstance(string, str):
-        out = string
-    else:
-        out = string.decode(encoding)
-
-    return out
-
-
-
 # Re-export from Rust for backwards compatibility (conftest module swap needs this)
-from ._bindings import unicode_is_ascii  # noqa: F401
+from ._bindings import unicode_is_ascii, to_native_string  # noqa: F401
