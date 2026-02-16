@@ -22,6 +22,7 @@ pub struct RequestParams {
 }
 
 impl RequestParams {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_args(
         method: String,
         url: String,

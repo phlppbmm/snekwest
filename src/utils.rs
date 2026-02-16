@@ -18,7 +18,7 @@ pub fn is_valid_cidr(string_network: &str) -> bool {
             Ok(m) => m,
             Err(_) => return false,
         };
-        if mask < 1 || mask > 32 {
+        if !(1..=32).contains(&mask) {
             return false;
         }
         ip_str.parse::<Ipv4Addr>().is_ok()
@@ -77,10 +77,7 @@ pub fn get_auth_from_url(url_str: &str) -> (String, String) {
     match url::Url::parse(url_str) {
         Ok(parsed) => {
             let username = percent_decode(parsed.username());
-            let password = parsed
-                .password()
-                .map(|p| percent_decode(p))
-                .unwrap_or_default();
+            let password = parsed.password().map(percent_decode).unwrap_or_default();
             (username, password)
         }
         Err(_) => (String::new(), String::new()),
@@ -208,7 +205,10 @@ pub fn parse_header_links(value: &str) -> Vec<HashMap<String, String>> {
 
     let mut links = Vec::new();
     // Split on ", *<" pattern (comma, optional spaces, <) — matching Python's re.split(r", *<", value)
-    for val in split_comma_angle(value).iter().map(|s| s.trim_start_matches('<')) {
+    for val in split_comma_angle(value)
+        .iter()
+        .map(|s| s.trim_start_matches('<'))
+    {
         let (url_part, params_part) = match val.split_once(';') {
             Some((u, p)) => (u, p),
             None => (val, ""),
@@ -217,7 +217,9 @@ pub fn parse_header_links(value: &str) -> Vec<HashMap<String, String>> {
         let mut link = HashMap::new();
         link.insert(
             "url".to_string(),
-            url_part.trim_matches(&['<', '>', ' ', '\'', '"'][..]).to_string(),
+            url_part
+                .trim_matches(&['<', '>', ' ', '\'', '"'][..])
+                .to_string(),
         );
 
         for param in params_part.split(';') {
@@ -265,17 +267,17 @@ fn split_comma_angle(s: &str) -> Vec<&str> {
 }
 
 #[pyfunction]
-pub fn get_encoding_from_headers(headers: &crate::case_insensitive_dict::CaseInsensitiveDict) -> Option<String> {
+pub fn get_encoding_from_headers(
+    headers: &crate::case_insensitive_dict::CaseInsensitiveDict,
+) -> Option<String> {
     Python::attach(|py| {
-        let content_type: Option<String> = headers
-            .get_value(py, "content-type")
-            .and_then(|val| {
-                if val.is_none(py) {
-                    None
-                } else {
-                    val.extract::<String>(py).ok()
-                }
-            });
+        let content_type: Option<String> = headers.get_value(py, "content-type").and_then(|val| {
+            if val.is_none(py) {
+                None
+            } else {
+                val.extract::<String>(py).ok()
+            }
+        });
 
         let content_type = content_type?;
         let (ct, params) = parse_content_type_header_inner(&content_type);
@@ -314,7 +316,10 @@ fn parse_content_type_header_inner(header: &str) -> (String, HashMap<String, Str
                 params.insert(key, value);
             } else {
                 // Sentinel value that _parse_content_type_header converts to Python True
-                params.insert(param.trim_matches(items_to_strip).to_lowercase(), "\x00__true__".to_string());
+                params.insert(
+                    param.trim_matches(items_to_strip).to_lowercase(),
+                    "\x00__true__".to_string(),
+                );
             }
         }
     }
@@ -411,10 +416,7 @@ pub fn guess_json_utf(data: &[u8]) -> Option<String> {
 // ============================================================================
 
 #[pyfunction]
-pub fn select_proxy(
-    url_str: &str,
-    proxies: Option<HashMap<String, String>>,
-) -> Option<String> {
+pub fn select_proxy(url_str: &str, proxies: Option<HashMap<String, String>>) -> Option<String> {
     let proxies = proxies.unwrap_or_default();
     if proxies.is_empty() {
         return None;
@@ -526,7 +528,10 @@ pub fn parse_dict_header(py: Python<'_>, value: &str) -> PyResult<Py<pyo3::types
             let name = &item[..eq_pos];
             let val = &item[eq_pos + 1..];
             if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
-                dict.set_item(name, unquote_header_value_inner(&val[1..val.len() - 1], false))?;
+                dict.set_item(
+                    name,
+                    unquote_header_value_inner(&val[1..val.len() - 1], false),
+                )?;
             } else {
                 dict.set_item(name, val)?;
             }
@@ -660,7 +665,9 @@ pub fn check_header_validity_rust(
             "InvalidHeader",
             format!(
                 "Header part ({}) from ({}, {}) must be of type str or bytes, not {}",
-                name, name, value,
+                name,
+                name,
+                value,
                 name.get_type().name()?
             ),
         ));
@@ -695,7 +702,9 @@ pub fn check_header_validity_rust(
             "InvalidHeader",
             format!(
                 "Header part ({}) from ({}, {}) must be of type str or bytes, not {}",
-                value, name, value,
+                value,
+                name,
+                value,
                 value.get_type().name()?
             ),
         ));
@@ -720,7 +729,11 @@ pub fn check_header_validity(py: Python<'_>, header: &Bound<'_, PyAny>) -> PyRes
 /// Equivalent to Python's to_native_string(string, encoding='ascii').
 #[pyfunction]
 #[pyo3(signature = (string, encoding="ascii"))]
-pub fn to_native_string(_py: Python<'_>, string: &Bound<'_, PyAny>, encoding: &str) -> PyResult<String> {
+pub fn to_native_string(
+    _py: Python<'_>,
+    string: &Bound<'_, PyAny>,
+    encoding: &str,
+) -> PyResult<String> {
     if let Ok(s) = string.extract::<String>() {
         Ok(s)
     } else {
@@ -938,7 +951,10 @@ mod tests {
     #[test]
     fn test_select_proxy_hostname_specific() {
         let mut proxies = HashMap::new();
-        proxies.insert("http://example.com".to_string(), "http://special:8080".to_string());
+        proxies.insert(
+            "http://example.com".to_string(),
+            "http://special:8080".to_string(),
+        );
         proxies.insert("http".to_string(), "http://default:8080".to_string());
 
         assert_eq!(
@@ -1075,12 +1091,18 @@ mod tests {
 
     #[test]
     fn test_unquote_header_value_escaped_backslash() {
-        assert_eq!(unquote_header_value_inner(r#""hello\\world""#, false), "hello\\world");
+        assert_eq!(
+            unquote_header_value_inner(r#""hello\\world""#, false),
+            "hello\\world"
+        );
     }
 
     #[test]
     fn test_unquote_header_value_escaped_quote() {
-        assert_eq!(unquote_header_value_inner(r#""hello\"world""#, false), r#"hello"world"#);
+        assert_eq!(
+            unquote_header_value_inner(r#""hello\"world""#, false),
+            r#"hello"world"#
+        );
     }
 
     #[test]

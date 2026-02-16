@@ -43,7 +43,10 @@ impl CaseInsensitiveDict {
     pub fn set_item(&mut self, py: Python<'_>, key: &str, value: Bound<'_, PyAny>) -> PyResult<()> {
         self.store.insert(
             key.to_lowercase(),
-            (key.to_string(), value.into_pyobject(py)?.into_any().unbind()),
+            (
+                key.to_string(),
+                value.into_pyobject(py)?.into_any().unbind(),
+            ),
         );
         Ok(())
     }
@@ -69,8 +72,7 @@ impl CaseInsensitiveDict {
                 // Handle both str and bytes keys
                 let key_str: String = if key.is_instance_of::<pyo3::types::PyBytes>() {
                     let bytes: Vec<u8> = key.extract()?;
-                    String::from_utf8(bytes)
-                        .map_err(|e| PyTypeError::new_err(e.to_string()))?
+                    String::from_utf8(bytes).map_err(|e| PyTypeError::new_err(e.to_string()))?
                 } else {
                     key.extract()?
                 };
@@ -160,7 +162,10 @@ impl CaseInsensitiveDict {
     fn __setitem__(&mut self, py: Python<'_>, key: &str, value: Bound<'_, PyAny>) -> PyResult<()> {
         self.store.insert(
             key.to_lowercase(),
-            (key.to_string(), value.into_pyobject(py)?.into_any().unbind()),
+            (
+                key.to_string(),
+                value.into_pyobject(py)?.into_any().unbind(),
+            ),
         );
         Ok(())
     }
@@ -243,7 +248,7 @@ impl CaseInsensitiveDict {
         }
 
         // Return NotImplemented for non-Mapping types
-        Ok(py.NotImplemented().into())
+        Ok(py.NotImplemented())
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
@@ -257,15 +262,10 @@ impl CaseInsensitiveDict {
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get(
-        &self,
-        py: Python<'_>,
-        key: &str,
-        default: Option<Py<PyAny>>,
-    ) -> PyResult<Py<PyAny>> {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match self.store.get(&key.to_lowercase()) {
             Some((_orig, val)) => Ok(val.clone_ref(py)),
-            None => Ok(default.unwrap_or_else(|| py.None().into())),
+            None => Ok(default.unwrap_or_else(|| py.None())),
         }
     }
 
@@ -302,7 +302,7 @@ impl CaseInsensitiveDict {
         if let Some((_orig, val)) = self.store.get(&lower) {
             return Ok(val.clone_ref(py));
         }
-        let val = default.unwrap_or_else(|| py.None().into());
+        let val = default.unwrap_or_else(|| py.None());
         self.store
             .insert(lower, (key.to_string(), val.clone_ref(py)));
         Ok(val)
@@ -338,7 +338,7 @@ impl CaseInsensitiveDict {
 
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let keys: Vec<String> = self.store.values().map(|(orig, _)| orig.clone()).collect();
-        Ok(PyList::new(py, &keys)?)
+        PyList::new(py, &keys)
     }
 
     fn values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
@@ -353,7 +353,10 @@ impl CaseInsensitiveDict {
     fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
         for (_lower, (orig, val)) in &self.store {
-            let tuple = PyTuple::new(py, &[orig.into_pyobject(py)?.into_any(), val.bind(py).clone()])?;
+            let tuple = PyTuple::new(
+                py,
+                &[orig.into_pyobject(py)?.into_any(), val.bind(py).clone()],
+            )?;
             list.append(tuple)?;
         }
         Ok(list)
@@ -362,7 +365,10 @@ impl CaseInsensitiveDict {
     fn lower_items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
         for (lower, (_orig, val)) in &self.store {
-            let tuple = PyTuple::new(py, &[lower.into_pyobject(py)?.into_any(), val.bind(py).clone()])?;
+            let tuple = PyTuple::new(
+                py,
+                &[lower.into_pyobject(py)?.into_any(), val.bind(py).clone()],
+            )?;
             list.append(tuple)?;
         }
         Ok(list)
