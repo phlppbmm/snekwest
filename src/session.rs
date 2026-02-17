@@ -1,8 +1,8 @@
+use indexmap::IndexMap;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict};
 use pythonize::depythonize;
 use reqwest::blocking::{Client, ClientBuilder};
-use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -822,8 +822,7 @@ impl Session {
         }
         if let Some((ref u, ref p)) = auth {
             use base64::Engine;
-            let encoded =
-                base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p));
+            let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u, p));
             req_headers.insert("Authorization".to_string(), format!("Basic {}", encoded));
         }
         if params.json.is_some() {
@@ -1622,7 +1621,10 @@ mod tests {
     fn test_reason_phrase_common_codes() {
         assert_eq!(reason_phrase(200), Some("OK".to_string()));
         assert_eq!(reason_phrase(404), Some("Not Found".to_string()));
-        assert_eq!(reason_phrase(500), Some("Internal Server Error".to_string()));
+        assert_eq!(
+            reason_phrase(500),
+            Some("Internal Server Error".to_string())
+        );
         assert_eq!(reason_phrase(301), Some("Moved Permanently".to_string()));
         assert_eq!(reason_phrase(302), Some("Found".to_string()));
     }
