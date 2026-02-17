@@ -121,8 +121,8 @@ pub struct RawResponseData {
 
 #[pyclass(dict)]
 pub struct Response {
-    // Content state
-    content_bytes: Option<Vec<u8>>,
+    // Content state — Arc for cheap cloning in iter_content
+    content_bytes: Option<Arc<Vec<u8>>>,
     content_loaded: bool,
     content_consumed: bool,
 
@@ -228,7 +228,7 @@ impl Response {
                 ns_kwargs.set_item("msg", &msg)?;
                 let fake_resp = ns_cls.call((), Some(&ns_kwargs))?;
                 bio.setattr("_original_response", &fake_resp)?;
-                (Some(data.body), true, true, Some(bio.unbind()))
+                (Some(Arc::new(data.body)), true, true, Some(bio.unbind()))
             };
 
         // 8. Build request PreparedRequest
@@ -315,7 +315,7 @@ impl Response {
             }
             all_bytes.extend(chunk);
         }
-        self.content_bytes = Some(all_bytes);
+        self.content_bytes = Some(Arc::new(all_bytes));
         self.content_loaded = true;
         Ok(())
     }
@@ -641,7 +641,7 @@ impl Response {
         } else {
             let bytes: Vec<u8> = v.extract()?;
             self.content_loaded = true;
-            self.content_bytes = Some(bytes);
+            self.content_bytes = Some(Arc::new(bytes));
         }
         Ok(())
     }
@@ -732,7 +732,7 @@ impl Response {
     fn apparent_encoding(&mut self, py: Python<'_>) -> PyResult<String> {
         self.ensure_content_loaded(py)?;
         self.content_consumed = true;
-        let bytes = self.content_bytes.as_deref().unwrap_or(b"");
+        let bytes = self.content_bytes.as_ref().map(|b| b.as_slice()).unwrap_or(b"");
         detect_encoding(py, bytes)
     }
 
@@ -770,10 +770,7 @@ impl Response {
         self.ensure_content_loaded(py)?;
         self.content_consumed = true;
 
-        let bytes = match &self.content_bytes {
-            Some(b) => b.clone(),
-            None => Vec::new(),
-        };
+        let bytes: &[u8] = self.content_bytes.as_ref().map(|b| b.as_slice()).unwrap_or(b"");
 
         let json_mod = py.import("json")?;
         let requests_jde = py
@@ -787,9 +784,9 @@ impl Response {
             .is_some_and(|e| e.bind(py).is_truthy().unwrap_or(false));
         if !has_encoding && bytes.len() > 3 {
             let guess_fn = py.import("snekwest.utils")?.getattr("guess_json_utf")?;
-            let enc: Option<String> = guess_fn.call1((PyBytes::new(py, &bytes),))?.extract()?;
+            let enc: Option<String> = guess_fn.call1((PyBytes::new(py, bytes),))?.extract()?;
             if let Some(enc) = enc {
-                let decoded = PyBytes::new(py, &bytes).call_method1("decode", (&enc,));
+                let decoded = PyBytes::new(py, bytes).call_method1("decode", (&enc,));
                 if let Ok(decoded) = decoded {
                     match json_mod.call_method("loads", (&decoded,), kwargs) {
                         Ok(result) => return Ok(result.unbind()),
@@ -1036,7 +1033,7 @@ impl Response {
 
 #[pyclass]
 pub struct ContentIterator {
-    content: Option<Vec<u8>>,
+    content: Option<Arc<Vec<u8>>>,
     pos: usize,
     raw: Option<Py<PyAny>>,
     chunk_size: usize,
