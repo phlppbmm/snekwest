@@ -670,7 +670,27 @@ impl PreparedRequest {
                     let invalid_json = py
                         .import("snekwest.exceptions")?
                         .getattr("InvalidJSONError")?;
-                    let kwargs = [("request", py.None())].into_py_dict(py)?;
+                    // Snapshot current state to attach to exception (matching upstream's request=self)
+                    let self_snapshot = Py::new(
+                        py,
+                        PreparedRequest {
+                            method: self.method.clone(),
+                            url: self.url.clone(),
+                            headers_inner: self.headers_inner.as_ref().map(|h| h.clone_ref(py)),
+                            body: None, // body hasn't been set yet at this point
+                            hooks_inner: self.hooks_inner.clone_ref(py),
+                            cookies_inner: self
+                                .cookies_inner
+                                .as_ref()
+                                .map(|c| c.clone_ref(py)),
+                            body_position_inner: self
+                                .body_position_inner
+                                .as_ref()
+                                .map(|p| p.clone_ref(py)),
+                        },
+                    )?;
+                    let kwargs =
+                        [("request", self_snapshot.into_any())].into_py_dict(py)?;
                     return Err(PyErr::from_value(
                         invalid_json.call((e.value(py),), Some(&kwargs))?,
                     ));
