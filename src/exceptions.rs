@@ -130,3 +130,134 @@ pub fn raise_nested_exception_with_request(
         Err(e) => e,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_python() {
+        Python::initialize();
+        // Add the python/ source directory to sys.path so snekwest is importable
+        Python::attach(|py| {
+            let sys = py.import("sys").unwrap();
+            let path = sys.getattr("path").unwrap();
+            let python_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/python");
+            let _ = path.call_method1("insert", (0, python_dir));
+        });
+    }
+
+    #[test]
+    fn test_make_exception_creates_correct_type() {
+        init_python();
+        Python::attach(|py| {
+            let err = make_exception(py, "ConnectionError", "test msg".into());
+            let instance = err.value(py);
+            let cls = py
+                .import("snekwest.exceptions")
+                .unwrap()
+                .getattr("ConnectionError")
+                .unwrap();
+            assert!(instance.is_instance(&cls).unwrap());
+        });
+    }
+
+    #[test]
+    fn test_make_exception_message() {
+        init_python();
+        Python::attach(|py| {
+            let err = make_exception(py, "SSLError", "certificate verify failed".into());
+            let instance = err.value(py);
+            let args: Vec<String> = instance
+                .getattr("args")
+                .unwrap()
+                .extract::<Vec<String>>()
+                .unwrap();
+            assert_eq!(args[0], "certificate verify failed");
+        });
+    }
+
+    #[test]
+    fn test_make_exception_invalid_class_name() {
+        init_python();
+        Python::attach(|py| {
+            // Should return an error (AttributeError), not panic
+            let err = make_exception(py, "NonexistentError", "msg".into());
+            let err_str = err.to_string();
+            assert!(
+                err_str.contains("NonexistentError") || err_str.contains("attribute"),
+                "Expected AttributeError, got: {}",
+                err_str
+            );
+        });
+    }
+
+    #[test]
+    fn test_make_exception_with_request_sets_attribute() {
+        init_python();
+        Python::attach(|py| {
+            let req = py
+                .eval(pyo3::ffi::c_str!("'fake_request'"), None, None)
+                .unwrap();
+            let req_py: Py<PyAny> = req.unbind();
+            let err =
+                make_exception_with_request(py, "ConnectionError", "msg".into(), Some(&req_py));
+            let instance = err.value(py);
+            let request_attr = instance.getattr("request").unwrap();
+            let val: String = request_attr.extract().unwrap();
+            assert_eq!(val, "fake_request");
+        });
+    }
+
+    #[test]
+    fn test_make_exception_without_request_has_none() {
+        init_python();
+        Python::attach(|py| {
+            let err = make_exception(py, "ConnectionError", "msg".into());
+            let instance = err.value(py);
+            let request_attr = instance.getattr("request").unwrap();
+            assert!(request_attr.is_none());
+        });
+    }
+
+    #[test]
+    fn test_raise_nested_exception_args_structure() {
+        init_python();
+        Python::attach(|py| {
+            let err = raise_nested_exception(py, "ReadTimeout", "Read timed out".into());
+            let instance = err.value(py);
+
+            // e.args[0] should be an IOError
+            let args = instance.getattr("args").unwrap();
+            let inner = args.get_item(0).unwrap();
+            assert!(inner
+                .is_instance(&py.import("builtins").unwrap().getattr("IOError").unwrap())
+                .unwrap());
+
+            // e.args[0].args[0] should be the message
+            let inner_args = inner.getattr("args").unwrap();
+            let msg: String = inner_args.get_item(0).unwrap().extract().unwrap();
+            assert_eq!(msg, "Read timed out");
+        });
+    }
+
+    #[test]
+    fn test_exception_cache_returns_same_class() {
+        init_python();
+        Python::attach(|py| {
+            let cls1 = get_exception_class(py, "ConnectionError").unwrap();
+            let cls2 = get_exception_class(py, "ConnectionError").unwrap();
+            assert!(cls1.is(&cls2));
+        });
+    }
+
+    #[test]
+    fn test_all_known_exceptions_resolve() {
+        init_python();
+        Python::attach(|py| {
+            for name in KNOWN_EXCEPTIONS {
+                let result = get_exception_class(py, name);
+                assert!(result.is_ok(), "Failed to resolve exception: {}", name);
+            }
+        });
+    }
+}
