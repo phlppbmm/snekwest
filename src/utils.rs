@@ -421,15 +421,105 @@ pub fn urldefragauth(url_str: &str) -> String {
     }
 }
 
+/// Check whether a URL string starts with a valid scheme per RFC 3986.
+///
+/// Mirrors urllib3's `_SCHEME_RE = ^(?:[a-zA-Z][a-zA-Z0-9+-]*:|/)`.
+/// Returns `true` when the string either:
+///   - begins with a valid scheme (letter, then `[a-zA-Z0-9+-]*`, then `:`)
+///   - begins with `/` (absolute path / authority)
+fn has_scheme_or_authority(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    // Starts with '/' → authority or absolute path
+    if bytes[0] == b'/' {
+        return true;
+    }
+    // Check for scheme: ^[a-zA-Z][a-zA-Z0-9+-]*:
+    if !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    for &b in &bytes[1..] {
+        if b == b':' {
+            return true; // found the colon that ends the scheme
+        }
+        if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'-') {
+            return false; // invalid scheme character (e.g. '.')
+        }
+    }
+    false
+}
+
 #[pyfunction]
 pub fn prepend_scheme_if_needed(url_str: &str, new_scheme: &str) -> String {
-    // If URL already has a scheme, return as-is
-    if url::Url::parse(url_str).is_ok() {
-        return url_str.to_string();
+    if url_str.is_empty() {
+        return format!("{}://", new_scheme);
     }
-    // Try prepending the scheme
-    let with_scheme = format!("{}://{}", new_scheme, url_str);
-    with_scheme
+
+    // Replicate urllib3's parse_url scheme detection.
+    //
+    // urllib3 uses `_SCHEME_RE = ^(?:[a-zA-Z][a-zA-Z0-9+-]*:|/)` to decide
+    // whether the URL already carries a scheme.  If it does NOT match, urllib3
+    // prepends "//" to force authority-based parsing, which makes scheme=None
+    // so that `prepend_scheme_if_needed` will set it to `new_scheme`.
+    //
+    // When _SCHEME_RE *does* match, the URL either:
+    //   (a) starts with '/' (path / protocol-relative) → scheme=None
+    //   (b) starts with a valid scheme name followed by ':' → scheme is set
+
+    let has_scheme = has_scheme_or_authority(url_str);
+
+    if !has_scheme {
+        // No scheme detected (e.g. "example.com:8080") — prepend new_scheme://
+        return format!("{}://{}", new_scheme, url_str);
+    }
+
+    // Protocol-relative URLs: //host...
+    // urllib3 parse_url: scheme=None, netloc=host → upstream sets scheme.
+    if url_str.starts_with("//") {
+        let stripped = url_str.trim_start_matches('/');
+        return format!("{}://{}", new_scheme, stripped);
+    }
+
+    // Starts with '/' but not '//' (absolute path) → scheme=None in urllib3.
+    if url_str.starts_with('/') {
+        return format!("{}://{}", new_scheme, url_str.trim_start_matches('/'));
+    }
+
+    // _SCHEME_RE matched a real scheme (e.g. "http:", "ftp:", "localhost:").
+    // Upstream leaves the scheme as-is and reconstructs via urlunparse.
+    //
+    // For well-formed URLs like "http://example.com" the reconstruction is
+    // essentially a no-op.  For edge cases like "localhost:3000", urllib3's
+    // parse_url returns (scheme="localhost", netloc=None, path="/3000").
+    // The netloc/path swap then makes netloc="/3000", path=None→"",
+    // so urlunparse produces "localhost:///3000".
+    //
+    // Replicate: parse with url::Url.  When there IS an authority (host),
+    // return the original string (avoid url::Url trailing-slash normalization).
+    // When there is NO authority, replicate the netloc/path swap.
+    if let Ok(parsed) = url::Url::parse(url_str) {
+        if parsed.host().is_some() {
+            // Normal URL with authority — return original to avoid normalization artifacts
+            return url_str.to_string();
+        }
+        // No authority: replicate upstream's netloc/path swap.
+        // urllib3: netloc=None → netloc, path = path, netloc → netloc=path, path=""
+        // urlunparse((scheme, old_path_as_netloc, "", "", query, fragment))
+        // url::Url may strip the leading '/' from opaque paths, so ensure it.
+        let scheme = parsed.scheme();
+        let path = parsed.path();
+        let netloc = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{}", path)
+        };
+        return format!("{}://{}", scheme, netloc);
+    }
+
+    // url::Url couldn't parse — return original
+    url_str.to_string()
 }
 
 #[pyfunction]
@@ -1335,6 +1425,51 @@ mod tests {
         assert_eq!(
             prepend_scheme_if_needed("example.com", "https"),
             "https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_port_without_scheme() {
+        // Critical case: url::Url::parse("example.com:8080") succeeds with scheme="example.com"
+        // but upstream Python correctly detects this as schemeless
+        assert_eq!(
+            prepend_scheme_if_needed("example.com:8080", "http"),
+            "http://example.com:8080"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_port_with_path() {
+        assert_eq!(
+            prepend_scheme_if_needed("example.com:8080/path", "http"),
+            "http://example.com:8080/path"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_protocol_relative() {
+        // Protocol-relative URL: //example.com should get scheme prepended
+        assert_eq!(
+            prepend_scheme_if_needed("//example.com", "http"),
+            "http://example.com"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_already_has_https() {
+        assert_eq!(
+            prepend_scheme_if_needed("https://secure.example.com/path", "http"),
+            "https://secure.example.com/path"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_with_auth() {
+        // Upstream parse_url treats "user" as scheme here, so scheme is NOT None
+        // and the result is the quirky "user:///pass@example.com"
+        assert_eq!(
+            prepend_scheme_if_needed("user:pass@example.com", "http"),
+            "user:///pass@example.com"
         );
     }
 
