@@ -815,10 +815,9 @@ impl Session {
 
         // Release the GIL so Python-based servers (httpbin etc.) can process
         Python::attach(|py| {
-            py.detach(|| request.send())
-                .map_err(|e| {
-                    map_reqwest_error(py, e, had_explicit_connect_timeout, has_proxies, None)
-                })
+            py.detach(|| request.send()).map_err(|e| {
+                map_reqwest_error(py, e, had_explicit_connect_timeout, has_proxies, None)
+            })
         })
     }
 
