@@ -4,6 +4,21 @@ use pyo3::types::{IntoPyDict, PyBytes, PyDict, PyList, PyString, PyTuple};
 
 use crate::case_insensitive_dict::CaseInsensitiveDict;
 
+/// Extract path + query from a URL string using pure Rust.
+fn path_url_from_str(url_str: &str) -> String {
+    match url::Url::parse(url_str) {
+        Ok(parsed) => {
+            let path = parsed.path();
+            let path = if path.is_empty() { "/" } else { path };
+            match parsed.query() {
+                Some(q) if !q.is_empty() => format!("{}?{}", path, q),
+                _ => path.to_string(),
+            }
+        }
+        Err(_) => "/".to_string(),
+    }
+}
+
 #[pyclass]
 pub struct PreparedRequest {
     #[pyo3(get, set)]
@@ -228,33 +243,12 @@ impl PreparedRequest {
     // -- path_url property --
 
     #[getter]
-    fn path_url(&self, py: Python<'_>) -> PyResult<String> {
-        let url = match &self.url {
-            Some(u) => u.clone(),
-            None => return Ok("/".to_string()),
+    fn path_url(&self) -> String {
+        let url_str = match &self.url {
+            Some(u) => u.as_str(),
+            None => return "/".to_string(),
         };
-        let urlsplit = py.import("urllib.parse")?.getattr("urlsplit")?;
-        let parts = urlsplit.call1((&url,))?;
-        let path: String = parts
-            .getattr("path")?
-            .extract::<String>()
-            .unwrap_or_default();
-        let query: String = parts
-            .getattr("query")?
-            .extract::<String>()
-            .unwrap_or_default();
-
-        let path = if path.is_empty() {
-            "/".to_string()
-        } else {
-            path
-        };
-
-        if query.is_empty() {
-            Ok(path)
-        } else {
-            Ok(format!("{}?{}", path, query))
-        }
+        path_url_from_str(url_str)
     }
 
     // -- Hook registration --
@@ -417,70 +411,96 @@ impl PreparedRequest {
             return Ok(());
         }
 
-        // Parse URL in Rust (replaces Python _parse_url)
-        let parsed = py
-            .import("urllib.parse")?
-            .getattr("urlparse")?
-            .call1((&url_str,))?;
-        let scheme: String = parsed.getattr("scheme")?.extract()?;
-        let scheme: Option<String> = if scheme.is_empty() {
-            None
-        } else {
-            Some(scheme)
-        };
-        let raw_netloc: String = parsed.getattr("netloc")?.extract()?;
-        let raw_path: String = parsed.getattr("path")?.extract()?;
-        let raw_query: String = parsed.getattr("query")?.extract()?;
-        let raw_fragment: String = parsed.getattr("fragment")?.extract()?;
-
-        let path: Option<String> = if raw_path.is_empty() {
-            None
-        } else {
-            Some(raw_path)
-        };
-        let query: Option<String> = if raw_query.is_empty() {
-            None
-        } else {
-            Some(raw_query)
-        };
-        let fragment: Option<String> = if raw_fragment.is_empty() {
-            None
-        } else {
-            Some(raw_fragment)
-        };
-
-        // Extract auth, host, port from netloc
-        let mut auth: Option<String> = None;
-        let mut host: Option<String> = None;
-        let mut port: Option<u16> = None;
-        if !raw_netloc.is_empty() {
-            let netloc_work = if raw_netloc.contains('@') {
-                // SAFETY: guarded by `contains('@')` check above
-                let (a, rest) = raw_netloc.rsplit_once('@').unwrap();
-                auth = Some(a.to_string());
-                rest.to_string()
-            } else {
-                raw_netloc.clone()
+        // Parse URL using pure Rust string parsing (no normalization, matches urlparse behavior)
+        let (scheme, auth, host, port, path, query, fragment) = {
+            // 1. Extract fragment (everything after first '#')
+            let (url_no_frag, fragment) = match url_str.find('#') {
+                Some(pos) => {
+                    let f = &url_str[pos + 1..];
+                    (
+                        &url_str[..pos],
+                        if f.is_empty() {
+                            None
+                        } else {
+                            Some(f.to_string())
+                        },
+                    )
+                }
+                None => (url_str.as_str(), None),
             };
-            if netloc_work.starts_with('[') {
-                // IPv6
-                if let Some(bracket_end) = netloc_work.find("]:") {
-                    host = Some(netloc_work[..bracket_end + 1].to_string());
-                    port = netloc_work[bracket_end + 2..].parse().ok();
-                } else {
-                    host = Some(netloc_work);
+
+            // 2. Extract scheme (everything before '://')
+            let (scheme, rest) = match url_no_frag.find("://") {
+                Some(pos) => (
+                    Some(url_no_frag[..pos].to_string()),
+                    &url_no_frag[pos + 3..],
+                ),
+                None => (None, url_no_frag),
+            };
+
+            // 3. Extract netloc (ends at first '/' or '?') and remaining path+query
+            let (netloc_str, after_netloc) = if scheme.is_some() {
+                let end = rest.find(['/', '?']).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            } else {
+                ("", rest)
+            };
+
+            // 4. Split path and query
+            let (path_str, query) = match after_netloc.find('?') {
+                Some(pos) => {
+                    let q = &after_netloc[pos + 1..];
+                    (
+                        &after_netloc[..pos],
+                        if q.is_empty() {
+                            None
+                        } else {
+                            Some(q.to_string())
+                        },
+                    )
                 }
-            } else if let Some((h, p)) = netloc_work.rsplit_once(':') {
-                if let Ok(p_num) = p.parse::<u16>() {
-                    host = Some(h.to_string());
-                    port = Some(p_num);
-                } else {
-                    host = Some(netloc_work);
+                None => (after_netloc, None),
+            };
+            let path = if path_str.is_empty() {
+                None
+            } else {
+                Some(path_str.to_string())
+            };
+
+            // 5. Parse netloc into auth, host, port
+            let (auth, host_port) = match netloc_str.rfind('@') {
+                Some(pos) => (Some(netloc_str[..pos].to_string()), &netloc_str[pos + 1..]),
+                None => (None, netloc_str),
+            };
+
+            let (host, port) = if host_port.starts_with('[') {
+                // IPv6: [addr]:port or [addr]
+                match host_port.find("]:") {
+                    Some(pos) => {
+                        let h = &host_port[..pos + 1];
+                        let p = host_port[pos + 2..].parse::<u16>().ok();
+                        (Some(h.to_string()), p)
+                    }
+                    None => (Some(host_port.to_string()), None),
                 }
             } else {
-                host = Some(netloc_work);
-            }
-        }
+                match host_port.rsplit_once(':') {
+                    Some((h, p)) => match p.parse::<u16>() {
+                        Ok(port_num) => (Some(h.to_string()), Some(port_num)),
+                        Err(_) => (Some(host_port.to_string()), None),
+                    },
+                    None => {
+                        if host_port.is_empty() {
+                            (None, None)
+                        } else {
+                            (Some(host_port.to_string()), None)
+                        }
+                    }
+                }
+            };
+
+            (scheme, auth, host, port, path, query, fragment)
+        };
 
         let scheme = match scheme {
             Some(s) if !s.is_empty() => s,
@@ -679,18 +699,14 @@ impl PreparedRequest {
                             headers_inner: self.headers_inner.as_ref().map(|h| h.clone_ref(py)),
                             body: None, // body hasn't been set yet at this point
                             hooks_inner: self.hooks_inner.clone_ref(py),
-                            cookies_inner: self
-                                .cookies_inner
-                                .as_ref()
-                                .map(|c| c.clone_ref(py)),
+                            cookies_inner: self.cookies_inner.as_ref().map(|c| c.clone_ref(py)),
                             body_position_inner: self
                                 .body_position_inner
                                 .as_ref()
                                 .map(|p| p.clone_ref(py)),
                         },
                     )?;
-                    let kwargs =
-                        [("request", self_snapshot.into_any())].into_py_dict(py)?;
+                    let kwargs = [("request", self_snapshot.into_any())].into_py_dict(py)?;
                     return Err(PyErr::from_value(
                         invalid_json.call((e.value(py),), Some(&kwargs))?,
                     ));
@@ -1035,15 +1051,11 @@ impl PreparedRequest {
                 body: self.body.as_ref().map(|b| b.clone_ref(py)),
                 hooks_inner: self.hooks_inner.clone_ref(py),
                 cookies_inner: self.cookies_inner.as_ref().map(|c| c.clone_ref(py)),
-                body_position_inner: self
-                    .body_position_inner
-                    .as_ref()
-                    .map(|p| p.clone_ref(py)),
+                body_position_inner: self.body_position_inner.as_ref().map(|p| p.clone_ref(py)),
             },
         )?;
 
-        let cookie_header =
-            get_cookie_header.call1((cookies_ref.bind(py), &self_snapshot))?;
+        let cookie_header = get_cookie_header.call1((cookies_ref.bind(py), &self_snapshot))?;
 
         if !cookie_header.is_none() {
             if let Some(ref headers) = self.headers_inner {
