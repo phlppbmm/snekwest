@@ -110,16 +110,9 @@ _GROUP_B_TESTS = frozenset(
         "TestPreparingURLs::test_different_connection_pool_for_tls_settings_verify_bundle_expired_cert",
         "TestPreparingURLs::test_different_connection_pool_for_tls_settings_verify_bundle_unexpired_cert",
         # test_structures.py
-        "TestCaseInsensitiveDict::test_repr",
         "TestLookupDict::test_repr",
-        # test_help.py -- all tests
-        "test_system_ssl",
-        "test_idna_without_version_attribute",
-        "test_idna_with_version_attribute",
-        # test_packages.py -- all tests
-        "test_can_access_urllib3_attribute",
-        "test_can_access_idna_attribute",
-        "test_can_access_chardet_attribute",
+        # test_packages.py — currently none (unskipped in #44)
+        # test_help.py — currently none (unskipped in #44)
         # test_adapters.py
         "test_request_url_trims_leading_path_separators",
         # test_requests.py -- require CWD=submodule root for cert/file paths
