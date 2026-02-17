@@ -862,6 +862,16 @@ pub fn unquote_header_value(value: &str, is_filename: bool) -> String {
 // 2g: Header validation (check_header_validity)
 // ============================================================================
 
+/// Check if a byte is whitespace per Python's `\s` regex pattern.
+///
+/// Python's `\s` matches all ASCII whitespace including vertical tab (0x0B).
+/// Rust's `is_ascii_whitespace()` covers SPACE (0x20), TAB (0x09), LF (0x0A),
+/// FF (0x0C), CR (0x0D) but omits VT (0x0B). This helper bridges the gap.
+#[inline]
+fn is_python_ascii_whitespace(b: u8) -> bool {
+    b.is_ascii_whitespace() || b == 0x0B
+}
+
 /// Validate a header name (str).
 /// Pattern: `^[^:\s][^:\r\n]*$`
 fn is_valid_header_name_str(name: &str) -> bool {
@@ -870,8 +880,8 @@ fn is_valid_header_name_str(name: &str) -> bool {
     }
     let bytes = name.as_bytes();
     let first = bytes[0];
-    // First char must not be ':' or whitespace
-    if first == b':' || first.is_ascii_whitespace() {
+    // First char must not be ':' or whitespace (including VT per Python \s)
+    if first == b':' || is_python_ascii_whitespace(first) {
         return false;
     }
     // Rest must not contain ':', '\r', '\n'
@@ -890,7 +900,7 @@ fn is_valid_header_name_bytes(name: &[u8]) -> bool {
         return false;
     }
     let first = name[0];
-    if first == b':' || first.is_ascii_whitespace() {
+    if first == b':' || is_python_ascii_whitespace(first) {
         return false;
     }
     for &b in &name[1..] {
@@ -908,8 +918,8 @@ fn is_valid_header_value_str(value: &str) -> bool {
         return true;
     }
     let bytes = value.as_bytes();
-    // First char must not be whitespace
-    if bytes[0].is_ascii_whitespace() {
+    // First char must not be whitespace (including VT per Python \S)
+    if is_python_ascii_whitespace(bytes[0]) {
         return false;
     }
     // Rest must not contain '\r' or '\n'
@@ -927,7 +937,7 @@ fn is_valid_header_value_bytes(value: &[u8]) -> bool {
     if value.is_empty() {
         return true;
     }
-    if value[0].is_ascii_whitespace() {
+    if is_python_ascii_whitespace(value[0]) {
         return false;
     }
     for &b in &value[1..] {
@@ -1553,6 +1563,44 @@ mod tests {
         assert!(!is_valid_header_value_bytes(b"\tbad"));
         assert!(!is_valid_header_value_bytes(b"bad\rvalue"));
         assert!(!is_valid_header_value_bytes(b"bad\nvalue"));
+    }
+
+    // -- Vertical tab (0x0B) rejection tests (Issue #74) --
+    // Python's \s includes VT (0x0B) but Rust's is_ascii_whitespace() does not.
+    // These tests ensure our header validation matches Python's behavior.
+
+    #[test]
+    fn test_header_name_str_rejects_vertical_tab() {
+        // Python regex ^[^\s:][^:\r\n]*$ rejects \x0B as leading char
+        assert!(
+            !is_valid_header_name_str("\x0Bbad"),
+            "Header name starting with VT (0x0B) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_header_name_bytes_rejects_vertical_tab() {
+        assert!(
+            !is_valid_header_name_bytes(b"\x0Bbad"),
+            "Header name bytes starting with VT (0x0B) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_header_value_str_rejects_vertical_tab() {
+        // Python regex ^\S[^\r\n]*$|^$ rejects \x0B as leading char
+        assert!(
+            !is_valid_header_value_str("\x0Bbad"),
+            "Header value starting with VT (0x0B) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_header_value_bytes_rejects_vertical_tab() {
+        assert!(
+            !is_valid_header_value_bytes(b"\x0Bbad"),
+            "Header value bytes starting with VT (0x0B) must be rejected"
+        );
     }
 
     // -- HTTP list/dict header parsing tests --
