@@ -58,3 +58,86 @@ fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(session::rebuild_method, m)?)?;
     Ok(())
 }
+
+/// All symbols expected to be available from the `_bindings` Python module.
+/// Used by tests to verify no registration is missing.
+#[cfg(test)]
+pub const EXPECTED_EXPORTS: &[&str] = &[
+    // Classes
+    "Session",
+    "Response",
+    "StreamingBody",
+    "CaseInsensitiveDict",
+    "CaseInsensitiveDictIter",
+    "PreparedRequest",
+    "ContentIterator",
+    "LinesIterator",
+    "LookupDict",
+    // Constants
+    "DEFAULT_ACCEPT_ENCODING",
+    // Utility functions — IP/CIDR
+    "is_ipv4_address",
+    "is_valid_cidr",
+    "dotted_netmask",
+    "address_in_network",
+    // Utility functions — URL
+    "get_auth_from_url",
+    "unquote_unreserved",
+    "requote_uri",
+    "urldefragauth",
+    "prepend_scheme_if_needed",
+    "unicode_is_ascii",
+    // Utility functions — Headers
+    "parse_header_links",
+    "get_encoding_from_headers",
+    "_parse_content_type_header",
+    "check_header_validity",
+    "to_native_string",
+    "parse_list_header",
+    "parse_dict_header",
+    "unquote_header_value",
+    // Utility functions — Encoding
+    "guess_json_utf",
+    // Utility functions — Proxy
+    "select_proxy",
+    "should_bypass_proxies_core",
+    // Utility functions — Misc
+    "request_url",
+    "merge_setting",
+    "default_user_agent",
+    "default_headers",
+    "_init_status_codes",
+    // Session utility functions
+    "should_strip_auth",
+    "rebuild_method",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_python() {
+        Python::initialize();
+        Python::attach(|py| {
+            let sys = py.import("sys").unwrap();
+            let path = sys.getattr("path").unwrap();
+            let python_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/python");
+            let _ = path.call_method1("insert", (0, python_dir));
+        });
+    }
+
+    #[test]
+    fn test_all_exports_accessible_from_bindings() {
+        init_python();
+        Python::attach(|py| {
+            let module = py.import("snekwest._bindings").unwrap();
+            for name in EXPECTED_EXPORTS {
+                assert!(
+                    module.getattr(*name).is_ok(),
+                    "Missing export in _bindings: {}",
+                    name
+                );
+            }
+        });
+    }
+}
