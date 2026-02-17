@@ -162,3 +162,10 @@ def pytest_collection_modifyitems(config, items):
         base_name = suffix.split("[")[0] if "[" in suffix else suffix
         if base_name in _GROUP_B_TESTS or suffix in _GROUP_B_TESTS:
             item.add_marker(_GROUP_B_SKIP)
+        # Windows: localhost:1 gives connect timeout instead of connection refused,
+        # causing ReadTimeout instead of ConnectionError (#46)
+        if (
+            sys.platform == "win32"
+            and "test_errors[http://localhost:1-ConnectionError]" in item.nodeid
+        ):
+            item.add_marker(pytest.mark.skip(reason="Windows: localhost:1 times out"))
