@@ -678,7 +678,9 @@ impl Response {
     }
 
     #[getter]
-    fn apparent_encoding(&self, py: Python<'_>) -> PyResult<String> {
+    fn apparent_encoding(&mut self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_content_loaded(py)?;
+        self.content_consumed = true;
         let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
         if !chardet.is_none() {
             let bytes = self.content_bytes.as_deref().unwrap_or(b"");
