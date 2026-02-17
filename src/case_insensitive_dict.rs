@@ -184,8 +184,11 @@ impl CaseInsensitiveDict {
         }
     }
 
-    fn __contains__(&self, key: &str) -> bool {
-        self.store.contains_key(&key.to_lowercase())
+    fn __contains__(&self, key: &Bound<'_, PyAny>) -> bool {
+        match key.extract::<String>() {
+            Ok(s) => self.store.contains_key(&s.to_lowercase()),
+            Err(_) => false, // Non-string keys (bytes, int, None) can never match
+        }
     }
 
     fn __len__(&self) -> usize {
