@@ -6,6 +6,7 @@ any downstream conftest.py files are loaded.
 Group B tests (Python-internal tests) are skipped via pytest_collection_modifyitems.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -104,10 +105,7 @@ _GROUP_B_TESTS = frozenset(
         # test_help.py — currently none (unskipped in #44)
         # test_adapters.py
         "test_request_url_trims_leading_path_separators",
-        # test_requests.py -- require CWD=submodule root for cert/file paths
-        "TestRequests::test_POSTBIN_GET_POST_FILES",
-        "TestRequests::test_POSTBIN_GET_POST_FILES_WITH_DATA",
-        "TestRequests::test_conflicting_post_params",
+        # (3 ENV file-path tests unskipped in #47)
         # mTLS test — requires urllib3 connection pool internals
         "TestPreparingURLs::test_different_connection_pool_for_mtls_settings",
         # Windows CI: localhost:1 times out instead of connection refused
@@ -128,6 +126,37 @@ _GROUP_B_TESTS = frozenset(
 )
 
 _GROUP_B_SKIP = pytest.mark.skip(reason="Group B: tests Python internals")
+
+# ---------------------------------------------------------------------------
+# Tests that use relative file paths expecting CWD = submodule root.
+# A fixture temporarily changes CWD to python-requests/ for these tests.
+# ---------------------------------------------------------------------------
+_SUBMODULE_CWD_TESTS = frozenset(
+    {
+        "TestRequests::test_POSTBIN_GET_POST_FILES",
+        "TestRequests::test_POSTBIN_GET_POST_FILES_WITH_DATA",
+        "TestRequests::test_conflicting_post_params",
+    }
+)
+
+_SUBMODULE_ROOT = str(Path(__file__).parent / "python-requests")
+
+
+@pytest.fixture(autouse=True)
+def _submodule_cwd(request):
+    """Temporarily change CWD to the submodule root for tests that open
+    relative file paths (e.g. ``open("requirements-dev.txt")``).
+    """
+    parts = request.node.nodeid.split("::", 1)
+    suffix = parts[1] if len(parts) > 1 else ""
+    base_name = suffix.split("[")[0] if "[" in suffix else suffix
+    if base_name in _SUBMODULE_CWD_TESTS or suffix in _SUBMODULE_CWD_TESTS:
+        old_cwd = os.getcwd()
+        os.chdir(_SUBMODULE_ROOT)
+        yield
+        os.chdir(old_cwd)
+    else:
+        yield
 
 
 def pytest_collection_modifyitems(config, items):
