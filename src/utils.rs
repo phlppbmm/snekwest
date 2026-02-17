@@ -30,20 +30,20 @@ impl LookupDict {
         format!("<lookup '{}'>", self.name.as_deref().unwrap_or(""))
     }
 
-    fn __getattr__(&self, py: Python<'_>, key: &str) -> Py<PyAny> {
+    fn __getattr__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         if key == "name" {
-            return self
+            return Ok(self
                 .name
                 .clone()
-                .into_pyobject(py)
-                .expect("name into_pyobject failed")
+                .into_pyobject(py)?
                 .into_any()
-                .unbind();
+                .unbind());
         }
-        self.data
+        Ok(self
+            .data
             .get(key)
             .map(|v| v.clone_ref(py))
-            .unwrap_or_else(|| py.None())
+            .unwrap_or_else(|| py.None()))
     }
 
     fn __setattr__(&mut self, key: String, value: Bound<'_, PyAny>) {
@@ -214,22 +214,19 @@ fn build_status_map() -> HashMap<String, i32> {
 
 /// Construct a pre-populated `LookupDict` with all HTTP status code mappings.
 #[pyfunction]
-pub fn _init_status_codes() -> LookupDict {
+pub fn _init_status_codes() -> PyResult<LookupDict> {
     let mut codes = LookupDict::new(Some("status_codes".to_string()));
     let status_map = build_status_map();
 
     Python::attach(|py| {
         for (key, code) in &status_map {
-            let code_obj: Py<PyAny> = code
-                .into_pyobject(py)
-                .expect("i32 into_pyobject failed")
-                .into_any()
-                .unbind();
+            let code_obj: Py<PyAny> = code.into_pyobject(py)?.into_any().unbind();
             codes.data.insert(key.clone(), code_obj);
         }
-    });
+        Ok::<(), PyErr>(())
+    })?;
 
-    codes
+    Ok(codes)
 }
 
 // ============================================================================
