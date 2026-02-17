@@ -185,7 +185,6 @@ class Session:
         files: Optional[dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[Union[float, Tuple[Optional[float], Optional[float]]]] = None,
-        allow_redirects: Optional[bool] = None,
         proxies: Optional[dict[str, str]] = None,
         stream: Optional[bool] = None,
         verify: Optional[bool] = None,
