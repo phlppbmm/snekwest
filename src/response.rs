@@ -678,7 +678,9 @@ impl Response {
     }
 
     #[getter]
-    fn apparent_encoding(&self, py: Python<'_>) -> PyResult<String> {
+    fn apparent_encoding(&mut self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_content_loaded(py)?;
+        self.content_consumed = true;
         let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
         if !chardet.is_none() {
             let bytes = self.content_bytes.as_deref().unwrap_or(b"");
@@ -710,7 +712,7 @@ impl Response {
                 let link = link_obj?;
                 let rel = link.call_method1("get", ("rel",))?;
                 let url_val = link.call_method1("get", ("url",))?;
-                let key = if !rel.is_none() { rel } else { url_val };
+                let key = if rel.is_truthy()? { rel } else { url_val };
                 dict.set_item(&key, &link)?;
             }
         }
@@ -735,7 +737,10 @@ impl Response {
             .getattr("JSONDecodeError")?;
 
         // Try encoding-specific parsing
-        let has_encoding = self.encoding_inner.is_some();
+        let has_encoding = self
+            .encoding_inner
+            .as_ref()
+            .is_some_and(|e| e.bind(py).is_truthy().unwrap_or(false));
         if !has_encoding && bytes.len() > 3 {
             let guess_fn = py.import("snekwest.utils")?.getattr("guess_json_utf")?;
             let enc: Option<String> = guess_fn.call1((PyBytes::new(py, &bytes),))?.extract()?;
