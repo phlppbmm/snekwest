@@ -335,17 +335,7 @@ impl Response {
 
         let encoding = match encoding {
             Some(e) => e,
-            None => {
-                // Use apparent_encoding
-                let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
-                if !chardet.is_none() {
-                    let result = chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
-                    let enc: Option<String> = result.get_item("encoding")?.extract()?;
-                    enc.unwrap_or_else(|| "utf-8".to_string())
-                } else {
-                    "utf-8".to_string()
-                }
-            }
+            None => detect_encoding(py, bytes)?,
         };
 
         // Decode
@@ -358,6 +348,19 @@ impl Response {
                 s.extract()
             }
         }
+    }
+}
+
+/// Detect encoding of byte content using chardet.
+/// Single source of truth — used by both `decode_text` and `apparent_encoding`.
+fn detect_encoding(py: Python<'_>, bytes: &[u8]) -> PyResult<String> {
+    let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
+    if !chardet.is_none() {
+        let result = chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
+        let enc: Option<String> = result.get_item("encoding")?.extract()?;
+        Ok(enc.unwrap_or_else(|| "utf-8".to_string()))
+    } else {
+        Ok("utf-8".to_string())
     }
 }
 
@@ -707,15 +710,8 @@ impl Response {
     fn apparent_encoding(&mut self, py: Python<'_>) -> PyResult<String> {
         self.ensure_content_loaded(py)?;
         self.content_consumed = true;
-        let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
-        if !chardet.is_none() {
-            let bytes = self.content_bytes.as_deref().unwrap_or(b"");
-            let result = chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
-            let enc: Option<String> = result.get_item("encoding")?.extract()?;
-            Ok(enc.unwrap_or_else(|| "utf-8".to_string()))
-        } else {
-            Ok("utf-8".to_string())
-        }
+        let bytes = self.content_bytes.as_deref().unwrap_or(b"");
+        detect_encoding(py, bytes)
     }
 
     #[getter]
