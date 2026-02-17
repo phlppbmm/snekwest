@@ -471,6 +471,8 @@ pub fn parse_header_links(value: &str) -> Vec<HashMap<String, String>> {
                     key.trim_matches(replace_chars).to_string(),
                     value.trim_matches(replace_chars).to_string(),
                 );
+            } else {
+                break;
             }
         }
 
@@ -1331,6 +1333,33 @@ mod tests {
         assert_eq!(links[0].get("rel").unwrap(), "next");
         assert_eq!(links[1].get("url").unwrap(), "http://example.com/prev");
         assert_eq!(links[1].get("rel").unwrap(), "prev");
+    }
+
+    #[test]
+    fn test_parse_header_links_breaks_on_malformed_param() {
+        // Upstream Python breaks out of param loop when a param has no '='.
+        // "<url>; rel=next; badparam; type=text" should stop at "badparam"
+        // and NOT include "type=text" in the result.
+        let links = parse_header_links(r#"<http://example.com>; rel=next; badparam; type=text"#);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].get("url").unwrap(), "http://example.com");
+        assert_eq!(links[0].get("rel").unwrap(), "next");
+        // "type" must NOT be present — parsing should have stopped at "badparam"
+        assert!(
+            links[0].get("type").is_none(),
+            "Expected 'type' to be absent because parsing should break at 'badparam', but got: {:?}",
+            links[0].get("type")
+        );
+    }
+
+    #[test]
+    fn test_parse_header_links_valid_params_still_work() {
+        // Normal params (all containing '=') should still be fully parsed.
+        let links = parse_header_links(r#"<http://example.com>; rel=next; type=text"#);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].get("url").unwrap(), "http://example.com");
+        assert_eq!(links[0].get("rel").unwrap(), "next");
+        assert_eq!(links[0].get("type").unwrap(), "text");
     }
 
     #[test]
