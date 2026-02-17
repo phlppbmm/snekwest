@@ -40,6 +40,7 @@ confcutdir = "."
 
 [dependency-groups]
 dev = [
+    "maturin>=1.8,<2.0",
     "pytest>=8.3.5",
     "pytest-httpbin>=2.1.0",
     "trustme",
