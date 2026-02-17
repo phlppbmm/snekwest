@@ -449,6 +449,36 @@ pub fn select_proxy(url_str: &str, proxies: Option<HashMap<String, String>>) -> 
     None
 }
 
+/// Compute the final URL to use when making a request.
+/// Handles proxy vs. direct and SOCKS proxy logic.
+/// Mirrors requests' `HTTPAdapter.request_url`.
+#[pyfunction]
+pub fn request_url(url: &str, path_url: &str, proxies: Option<HashMap<String, String>>) -> String {
+    let proxy = select_proxy(url, proxies);
+
+    let scheme = url::Url::parse(url)
+        .map(|u| u.scheme().to_string())
+        .unwrap_or_default();
+
+    let is_proxied_http = proxy.is_some() && scheme != "https";
+    let using_socks = proxy.as_ref().is_some_and(|p| {
+        url::Url::parse(p)
+            .map(|u| u.scheme().starts_with("socks"))
+            .unwrap_or(false)
+    });
+
+    let mut result = path_url.to_string();
+    if result.starts_with("//") {
+        result = format!("/{}", result.trim_start_matches('/'));
+    }
+
+    if is_proxied_http && !using_socks {
+        result = urldefragauth(url);
+    }
+
+    result
+}
+
 // ============================================================================
 // 2f: HTTP list/dict header parsing
 // ============================================================================
@@ -816,9 +846,7 @@ pub fn merge_setting(
         Some(dc) => dc.clone(),
         None => py.import("collections")?.getattr("OrderedDict")?,
     };
-    let to_key_val_list = py
-        .import("snekwest.utils")?
-        .getattr("to_key_val_list")?;
+    let to_key_val_list = py.import("snekwest.utils")?.getattr("to_key_val_list")?;
     let session_kvl = to_key_val_list.call1((session_setting,))?;
     let request_kvl = to_key_val_list.call1((request_setting,))?;
     let merged = dict_cls.call1((&session_kvl,))?;
@@ -863,11 +891,17 @@ pub fn default_user_agent(py: Python<'_>, name: &str) -> PyResult<String> {
 
 /// Return default HTTP headers as a CaseInsensitiveDict.
 #[pyfunction]
-pub fn default_headers(py: Python<'_>) -> PyResult<crate::case_insensitive_dict::CaseInsensitiveDict> {
+pub fn default_headers(
+    py: Python<'_>,
+) -> PyResult<crate::case_insensitive_dict::CaseInsensitiveDict> {
     let mut dict = crate::case_insensitive_dict::CaseInsensitiveDict::new_empty();
     let ua = default_user_agent(py, "python-requests")?;
     dict.set_item(py, "User-Agent", PyString::new(py, &ua).into_any())?;
-    dict.set_item(py, "Accept-Encoding", PyString::new(py, DEFAULT_ACCEPT_ENCODING).into_any())?;
+    dict.set_item(
+        py,
+        "Accept-Encoding",
+        PyString::new(py, DEFAULT_ACCEPT_ENCODING).into_any(),
+    )?;
     dict.set_item(py, "Accept", PyString::new(py, "*/*").into_any())?;
     dict.set_item(py, "Connection", PyString::new(py, "keep-alive").into_any())?;
     Ok(dict)
@@ -1259,5 +1293,68 @@ mod tests {
     fn test_parse_list_header_empty() {
         let result = parse_list_header("");
         assert!(result.is_empty());
+    }
+
+    // -- request_url tests --
+
+    #[test]
+    fn test_request_url_no_proxy() {
+        assert_eq!(
+            request_url("http://example.com/path?q=1", "/path?q=1", None),
+            "/path?q=1"
+        );
+    }
+
+    #[test]
+    fn test_request_url_http_proxy() {
+        let mut proxies = HashMap::new();
+        proxies.insert(
+            "http".to_string(),
+            "http://proxy.example.com:8080".to_string(),
+        );
+        assert_eq!(
+            request_url(
+                "http://example.com/path?q=1#frag",
+                "/path?q=1",
+                Some(proxies)
+            ),
+            "http://example.com/path?q=1" // urldefragauth strips fragment and auth
+        );
+    }
+
+    #[test]
+    fn test_request_url_https_no_proxy_override() {
+        // HTTPS requests don't use proxy URL even if proxy is set
+        let mut proxies = HashMap::new();
+        proxies.insert(
+            "http".to_string(),
+            "http://proxy.example.com:8080".to_string(),
+        );
+        assert_eq!(
+            request_url("https://example.com/path", "/path", Some(proxies)),
+            "/path"
+        );
+    }
+
+    #[test]
+    fn test_request_url_socks_proxy() {
+        // SOCKS proxy: use path_url, not full URL
+        let mut proxies = HashMap::new();
+        proxies.insert(
+            "http".to_string(),
+            "socks5://proxy.example.com:1080".to_string(),
+        );
+        assert_eq!(
+            request_url("http://example.com/path", "/path", Some(proxies)),
+            "/path"
+        );
+    }
+
+    #[test]
+    fn test_request_url_leading_double_slash() {
+        assert_eq!(
+            request_url("http://example.com//path", "//path", None),
+            "/path"
+        );
     }
 }

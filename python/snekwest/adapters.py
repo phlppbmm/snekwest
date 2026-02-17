@@ -10,6 +10,7 @@ import os.path
 import socket  # noqa: F401
 
 from .auth import _basic_auth_str  # noqa: F401
+from ._bindings import request_url as _request_url
 from .compat import basestring, urlparse  # noqa: F401
 from .cookies import extract_cookies_to_jar  # noqa: F401
 from .exceptions import (  # noqa: F401
@@ -199,29 +200,8 @@ class HTTPAdapter(BaseAdapter):
         return resp
 
     def request_url(self, request, proxies):
-        """Obtain the url to use when making the final request.
-
-        :param request: The :class:`PreparedRequest <PreparedRequest>` being sent.
-        :param proxies: A dictionary of proxies.
-        :rtype: str
-        """
-        proxy = select_proxy(request.url, proxies)
-        scheme = urlparse(request.url).scheme
-
-        is_proxied_http_request = proxy and scheme != "https"
-        using_socks_proxy = False
-        if proxy:
-            proxy_scheme = urlparse(proxy).scheme.lower()
-            using_socks_proxy = proxy_scheme.startswith("socks")
-
-        url = request.path_url
-        if url.startswith("//"):
-            url = f"/{url.lstrip('/')}"
-
-        if is_proxied_http_request and not using_socks_proxy:
-            url = urldefragauth(request.url)
-
-        return url
+        """Obtain the url to use when making the final request."""
+        return _request_url(request.url, request.path_url, proxies)
 
     def add_headers(self, request, **kwargs):
         """Add any headers needed by the connection."""
