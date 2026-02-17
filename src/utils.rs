@@ -1881,6 +1881,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_request_url_leading_triple_slash() {
+        // Upstream: f"/{url.lstrip('/')}" strips ALL leading slashes.
+        // "///path" → "/" + "path" = "/path"
+        assert_eq!(
+            request_url("http://example.com///path", "///path", None),
+            "/path"
+        );
+    }
+
+    #[test]
+    fn test_request_url_leading_quad_slash() {
+        // "////path" → "/" + "path" = "/path"
+        assert_eq!(
+            request_url("http://example.com////path", "////path", None),
+            "/path"
+        );
+    }
+
+    #[test]
+    fn test_request_url_only_double_slash() {
+        // "//" → "/" + "" = "/"
+        assert_eq!(request_url("http://example.com//", "//", None), "/");
+    }
+
     // -- should_bypass_proxies_core tests --
 
     #[test]
