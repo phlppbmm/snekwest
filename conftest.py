@@ -73,9 +73,8 @@ for _name, _mod in list(sys.modules.items()):
 _GROUP_B_TESTS = frozenset(
     {
         # test_requests.py -- Python-internal tests
-        "TestRequests::test_cookielib_cookiejar_on_redirect",
+        # (2 cookie handling tests unskipped in #45)
         "TestRequests::test_https_warnings",
-        "TestRequests::test_cookie_policy_copy",
         "TestRequests::test_response_is_iterable",
         "TestRequests::test_iter_content_wraps_exceptions",
         "TestRequests::test_request_and_response_are_pickleable",
