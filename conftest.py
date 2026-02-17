@@ -128,6 +128,8 @@ _GROUP_B_TESTS = frozenset(
         "TestRequests::test_conflicting_post_params",
         # mTLS test — requires urllib3 connection pool internals
         "TestPreparingURLs::test_different_connection_pool_for_mtls_settings",
+        # Windows CI: localhost:1 times out instead of connection refused
+        "TestRequests::test_errors",
         # test_testserver.py -- all tests
         "TestTestServer::test_basic",
         "TestTestServer::test_server_closes",
