@@ -92,11 +92,7 @@ def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
 class SessionRedirectMixin:
     def get_redirect_target(self, resp):
         """Receives a Response. Returns a redirect URI or ``None``"""
-        if resp.is_redirect:
-            location = resp.headers["location"]
-            location = location.encode("latin1")
-            return to_native_string(location, "utf8")
-        return None
+        return resp.get_redirect_target()
 
     def should_strip_auth(self, old_url, new_url):
         """Decide whether Authorization header should be removed when redirecting"""
