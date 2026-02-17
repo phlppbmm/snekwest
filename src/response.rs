@@ -299,7 +299,17 @@ impl Response {
         let mut all_bytes: Vec<u8> = Vec::new();
         loop {
             let chunk_obj = raw.bind(py).call_method1("read", (CONTENT_CHUNK_SIZE,))?;
-            let chunk: Vec<u8> = chunk_obj.extract()?;
+            // raw.read() may return bytes (normal) or str (e.g. StringIO mock)
+            let chunk: Vec<u8> = if let Ok(b) = chunk_obj.extract::<Vec<u8>>() {
+                b
+            } else if let Ok(s) = chunk_obj.extract::<String>() {
+                if s.is_empty() {
+                    break;
+                }
+                s.into_bytes()
+            } else {
+                break;
+            };
             if chunk.is_empty() {
                 break;
             }
@@ -1041,7 +1051,15 @@ impl ContentIterator {
             } else {
                 raw.bind(py).call_method1("read", (self.chunk_size,))?
             };
-            let chunk_bytes: Vec<u8> = chunk.extract()?;
+            // raw.read() may return bytes (normal) or str (e.g. StringIO mock)
+            let chunk_bytes: Vec<u8> = if let Ok(b) = chunk.extract::<Vec<u8>>() {
+                b
+            } else if let Ok(s) = chunk.extract::<String>() {
+                s.into_bytes()
+            } else {
+                self.done = true;
+                return Ok(None);
+            };
             if chunk_bytes.is_empty() {
                 self.done = true;
                 return Ok(None);
