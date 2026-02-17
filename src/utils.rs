@@ -1190,8 +1190,14 @@ pub fn merge_setting(
         return Ok(request_setting.clone().unbind());
     }
     // Case 4: Both are Mappings → merge
-    // CaseInsensitiveDict fast path: when BOTH are CID, merge using the Rust store directly
-    if let (Ok(session_cid), Ok(request_cid)) = (
+    // CaseInsensitiveDict fast path: only when dict_class is explicitly CaseInsensitiveDict
+    let is_cid_class = dict_class.is_some_and(|dc| {
+        dc.getattr("__name__")
+            .and_then(|n| n.extract::<String>())
+            .is_ok_and(|name| name == "CaseInsensitiveDict")
+    });
+    if is_cid_class {
+        if let (Ok(session_cid), Ok(request_cid)) = (
         session_setting.cast::<crate::case_insensitive_dict::CaseInsensitiveDict>(),
         request_setting.cast::<crate::case_insensitive_dict::CaseInsensitiveDict>(),
     ) {
@@ -1222,6 +1228,7 @@ pub fn merge_setting(
             merged_obj.bind(py).call_method1("__delitem__", (key,))?;
         }
         return Ok(merged_obj.into_any());
+        }
     }
     // Generic path: for other Mappings
     let dict_cls = match dict_class {
