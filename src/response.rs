@@ -710,7 +710,7 @@ impl Response {
                 let link = link_obj?;
                 let rel = link.call_method1("get", ("rel",))?;
                 let url_val = link.call_method1("get", ("url",))?;
-                let key = if !rel.is_none() { rel } else { url_val };
+                let key = if rel.is_truthy()? { rel } else { url_val };
                 dict.set_item(&key, &link)?;
             }
         }
