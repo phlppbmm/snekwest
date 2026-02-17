@@ -43,7 +43,7 @@ jobs:
       - name: Build extension
         run: uv run maturin develop --release
       - name: Test Group A (Python — external behavior)
-        run: uv run pytest python-requests/tests/test_requests.py -q
+        run: uv run pytest python-requests/tests/test_requests.py -q -c pyproject.toml
       - name: Test Group C (Rust unit tests)
         run: cargo test
 
