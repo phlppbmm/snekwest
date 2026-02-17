@@ -548,11 +548,9 @@ impl PreparedRequest {
         let params_obj = params.and_then(|p| if p.is_none() { None } else { Some(p.clone()) });
 
         let query = if let Some(params_val) = params_obj {
-            // Convert bytes params to string
+            // Convert bytes params to string using ASCII (matches upstream to_native_string)
             let params_val = if params_val.is_instance_of::<PyBytes>() {
-                let bytes: Vec<u8> = params_val.extract()?;
-                let s = String::from_utf8(bytes).unwrap_or_default();
-                s.into_pyobject(py)?.into_any()
+                params_val.call_method1("decode", ("ascii",))?
             } else {
                 params_val
             };
