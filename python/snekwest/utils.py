@@ -18,7 +18,7 @@ import warnings
 import zipfile
 from collections import OrderedDict
 from . import certs
-from .__version__ import __version__
+from .__version__ import __version__  # noqa: F401
 
 # to_native_string is unused here, but imported here for backwards compatibility
 from ._internal_utils import (  # noqa: F401
@@ -50,7 +50,7 @@ from .exceptions import (  # noqa: F401
     InvalidURL,
     UnrewindableBodyError,
 )
-from .structures import CaseInsensitiveDict
+from .structures import CaseInsensitiveDict  # noqa: F401
 
 # Import Rust-implemented utility functions
 from ._bindings import (  # noqa: F401, F811, E402
