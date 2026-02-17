@@ -44,5 +44,9 @@ fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(utils::parse_list_header, m)?)?;
     m.add_function(wrap_pyfunction!(utils::parse_dict_header, m)?)?;
     m.add_function(wrap_pyfunction!(utils::unquote_header_value, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::merge_setting, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::default_user_agent, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::default_headers, m)?)?;
+    m.add("DEFAULT_ACCEPT_ENCODING", utils::DEFAULT_ACCEPT_ENCODING)?;
     Ok(())
 }

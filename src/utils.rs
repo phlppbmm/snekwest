@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use pyo3::types::PyString;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
@@ -741,6 +742,135 @@ pub fn to_native_string(
         let decoded = string.call_method1("decode", (encoding,))?;
         decoded.extract::<String>()
     }
+}
+
+// ============================================================================
+// 2h: Session merge helpers
+// ============================================================================
+
+/// Merge a request-level setting with a session-level setting.
+///
+/// Python reference (sessions.py:62-80):
+///   - If session_setting is None → return request_setting
+///   - If request_setting is None → return session_setting
+///   - If either is not a Mapping → return request_setting
+///   - Both are Mappings → merge session into request, prune None-valued keys
+///   - Fast path when both inputs are CaseInsensitiveDict
+#[pyfunction]
+#[pyo3(signature = (request_setting, session_setting, dict_class=None))]
+pub fn merge_setting(
+    py: Python<'_>,
+    request_setting: &Bound<'_, PyAny>,
+    session_setting: &Bound<'_, PyAny>,
+    dict_class: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    // Case 1: session_setting is None → return request_setting
+    if session_setting.is_none() {
+        return Ok(request_setting.clone().unbind());
+    }
+    // Case 2: request_setting is None → return session_setting
+    if request_setting.is_none() {
+        return Ok(session_setting.clone().unbind());
+    }
+    // Case 3: Either is not a Mapping → return request_setting
+    let mapping_abc = py.import("collections.abc")?.getattr("Mapping")?;
+    if !(session_setting.is_instance(&mapping_abc)? && request_setting.is_instance(&mapping_abc)?) {
+        return Ok(request_setting.clone().unbind());
+    }
+    // Case 4: Both are Mappings → merge
+    // CaseInsensitiveDict fast path: when BOTH are CID, merge using the Rust store directly
+    if let (Ok(session_cid), Ok(request_cid)) = (
+        session_setting.cast::<crate::case_insensitive_dict::CaseInsensitiveDict>(),
+        request_setting.cast::<crate::case_insensitive_dict::CaseInsensitiveDict>(),
+    ) {
+        let mut merged = crate::case_insensitive_dict::CaseInsensitiveDict::new_empty();
+        // First: iterate session's items
+        {
+            let session_ref = session_cid.borrow();
+            for (orig_key, val) in session_ref.iter_items() {
+                merged.set_item(py, orig_key, val.bind(py).clone())?;
+            }
+        }
+        // Then: overlay request's items
+        {
+            let request_ref = request_cid.borrow();
+            for (orig_key, val) in request_ref.iter_items() {
+                merged.set_item(py, orig_key, val.bind(py).clone())?;
+            }
+        }
+        // Prune entries where value is None
+        let none_keys: Vec<String> = merged
+            .iter_items()
+            .filter(|(_, val)| val.bind(py).is_none())
+            .map(|(key, _)| key.to_lowercase())
+            .collect();
+        // Create the Python object, then delete None-valued keys via its __delitem__
+        let merged_obj = pyo3::Py::new(py, merged)?;
+        for key in &none_keys {
+            merged_obj.bind(py).call_method1("__delitem__", (key,))?;
+        }
+        return Ok(merged_obj.into_any());
+    }
+    // Generic path: for other Mappings
+    let dict_cls = match dict_class {
+        Some(dc) => dc.clone(),
+        None => py.import("collections")?.getattr("OrderedDict")?,
+    };
+    let to_key_val_list = py
+        .import("snekwest.utils")?
+        .getattr("to_key_val_list")?;
+    let session_kvl = to_key_val_list.call1((session_setting,))?;
+    let request_kvl = to_key_val_list.call1((request_setting,))?;
+    let merged = dict_cls.call1((&session_kvl,))?;
+    merged.call_method1("update", (&request_kvl,))?;
+    // Prune None-valued keys
+    let none_keys: Vec<Py<PyAny>> = merged
+        .call_method0("items")?
+        .try_iter()?
+        .filter_map(|item| item.ok())
+        .filter_map(|item| {
+            let val = item.get_item(1).ok()?;
+            if val.is_none() {
+                Some(item.get_item(0).ok()?.unbind())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in &none_keys {
+        merged.del_item(key)?;
+    }
+    Ok(merged.unbind())
+}
+
+// ============================================================================
+// 2i: Default headers / user-agent
+// ============================================================================
+
+/// Inline what urllib3.util.make_headers(accept_encoding=True) returns.
+pub const DEFAULT_ACCEPT_ENCODING: &str = "gzip, deflate, br";
+
+/// Return a string representing the default user agent.
+#[pyfunction]
+#[pyo3(signature = (name="python-requests"))]
+pub fn default_user_agent(py: Python<'_>, name: &str) -> PyResult<String> {
+    let version: String = py
+        .import("snekwest.__version__")?
+        .getattr("__version__")?
+        .extract()?;
+    Ok(format!("{name}/{version}"))
+}
+
+/// Return default HTTP headers as a CaseInsensitiveDict.
+#[pyfunction]
+pub fn default_headers(py: Python<'_>) -> PyResult<crate::case_insensitive_dict::CaseInsensitiveDict> {
+    let mut dict = crate::case_insensitive_dict::CaseInsensitiveDict::new_empty();
+    let ua = default_user_agent(py, "python-requests")?;
+    dict.set_item(py, "User-Agent", PyString::new(py, &ua).into_any())?;
+    dict.set_item(py, "Accept-Encoding", PyString::new(py, DEFAULT_ACCEPT_ENCODING).into_any())?;
+    dict.set_item(py, "Accept", PyString::new(py, "*/*").into_any())?;
+    dict.set_item(py, "Connection", PyString::new(py, "keep-alive").into_any())?;
+    Ok(dict)
 }
 
 // ============================================================================
