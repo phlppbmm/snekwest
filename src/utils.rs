@@ -449,6 +449,44 @@ pub fn select_proxy(url_str: &str, proxies: Option<HashMap<String, String>>) -> 
     None
 }
 
+/// Core no_proxy matching logic. Checks if a hostname (possibly with port)
+/// matches any entry in a comma-separated no_proxy string.
+/// This is the inner loop from Python's should_bypass_proxies, extracted
+/// for performance (called on every request with trust_env=True).
+#[pyfunction]
+pub fn should_bypass_proxies_core(
+    hostname: &str,
+    port: Option<u16>,
+    is_ipv4: bool,
+    no_proxy: &str,
+) -> bool {
+    for entry in no_proxy.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        if is_ipv4 {
+            if is_valid_cidr(entry) {
+                if address_in_network(hostname, entry) {
+                    return true;
+                }
+            } else if hostname == entry {
+                return true;
+            }
+        } else {
+            let host_with_port = match port {
+                Some(p) => format!("{}:{}", hostname, p),
+                None => hostname.to_string(),
+            };
+            if hostname.ends_with(entry) || host_with_port.ends_with(entry) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Compute the final URL to use when making a request.
 /// Handles proxy vs. direct and SOCKS proxy logic.
 /// Mirrors requests' `HTTPAdapter.request_url`.
@@ -1356,5 +1394,79 @@ mod tests {
             request_url("http://example.com//path", "//path", None),
             "/path"
         );
+    }
+
+    // -- should_bypass_proxies_core tests --
+
+    #[test]
+    fn test_bypass_proxies_cidr_match() {
+        assert!(should_bypass_proxies_core(
+            "192.168.1.100",
+            None,
+            true,
+            "192.168.1.0/24"
+        ));
+    }
+
+    #[test]
+    fn test_bypass_proxies_exact_ip_match() {
+        assert!(should_bypass_proxies_core(
+            "10.0.0.1",
+            None,
+            true,
+            "10.0.0.1,172.16.0.1"
+        ));
+    }
+
+    #[test]
+    fn test_bypass_proxies_ip_no_match() {
+        assert!(!should_bypass_proxies_core(
+            "10.0.0.2", None, true, "10.0.0.1"
+        ));
+    }
+
+    #[test]
+    fn test_bypass_proxies_hostname_suffix() {
+        assert!(should_bypass_proxies_core(
+            "api.example.com",
+            None,
+            false,
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_bypass_proxies_hostname_with_port() {
+        assert!(should_bypass_proxies_core(
+            "google.com",
+            Some(6000),
+            false,
+            "google.com:6000"
+        ));
+    }
+
+    #[test]
+    fn test_bypass_proxies_hostname_no_match() {
+        assert!(!should_bypass_proxies_core(
+            "other.com",
+            None,
+            false,
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_bypass_proxies_empty_no_proxy() {
+        assert!(!should_bypass_proxies_core("example.com", None, false, ""));
+    }
+
+    #[test]
+    fn test_bypass_proxies_spaces_in_entries() {
+        assert!(should_bypass_proxies_core(
+            "example.com",
+            None,
+            false,
+            " example.com , other.com "
+        ));
     }
 }

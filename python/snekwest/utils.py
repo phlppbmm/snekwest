@@ -69,6 +69,7 @@ from ._bindings import (  # noqa: F401, F811, E402
     _parse_content_type_header,
     guess_json_utf,
     select_proxy,
+    should_bypass_proxies_core as _should_bypass_proxies_core,
     check_header_validity,
     parse_list_header,
     parse_dict_header,
@@ -551,29 +552,14 @@ def should_bypass_proxies(url, no_proxy):
         return True
 
     if no_proxy:
-        # We need to check whether we match here. We need to see if we match
-        # the end of the hostname, both with and without the port.
-        no_proxy = (host for host in no_proxy.replace(" ", "").split(",") if host)
-
-        if is_ipv4_address(parsed.hostname):
-            for proxy_ip in no_proxy:
-                if is_valid_cidr(proxy_ip):
-                    if address_in_network(parsed.hostname, proxy_ip):
-                        return True
-                elif parsed.hostname == proxy_ip:
-                    # If no_proxy ip was defined in plain IP notation instead of cidr notation &
-                    # matches the IP of the index
-                    return True
-        else:
-            host_with_port = parsed.hostname
-            if parsed.port:
-                host_with_port += f":{parsed.port}"
-
-            for host in no_proxy:
-                if parsed.hostname.endswith(host) or host_with_port.endswith(host):
-                    # The URL does match something in no_proxy, so we don't want
-                    # to apply the proxies on this URL.
-                    return True
+        # Delegate the matching logic to Rust
+        if _should_bypass_proxies_core(
+            parsed.hostname,
+            parsed.port,
+            is_ipv4_address(parsed.hostname),
+            no_proxy,
+        ):
+            return True
 
     with set_environ("no_proxy", no_proxy_arg):
         # parsed.hostname can be `None` in cases such as a file URI.
