@@ -837,7 +837,9 @@ impl Response {
                 done: false,
             }
         } else {
-            // Stream from raw
+            // Stream from raw — mark consumed eagerly so a second
+            // iter_content() call raises StreamConsumedError.
+            self.content_consumed = true;
             ContentIterator {
                 content: None,
                 pos: 0,
