@@ -879,8 +879,10 @@ impl PreparedRequest {
                 auth_val
             };
 
-            // Call auth(self) - auth modifies our headers in-place and returns self
-            // We need to create a temporary Python object for self
+            // Upstream: r = auth(self); self.__dict__.update(r.__dict__)
+            // We create a temporary Python object from self's current state,
+            // pass it to the auth callable (which modifies it in-place),
+            // then read modified fields back from the returned object.
             let self_ref = Py::new(
                 py,
                 PreparedRequest {
@@ -896,17 +898,47 @@ impl PreparedRequest {
 
             let result = auth_callable.call1((&self_ref,))?;
 
-            // Copy fields back from the result
-            if let Ok(r) = result.cast::<PreparedRequest>() {
-                let r = r.borrow();
-                self.method = r.method.clone();
-                self.url = r.url.clone();
-                self.headers_inner = r.headers_inner.as_ref().map(|h| h.clone_ref(py));
-                self.body = r.body.as_ref().map(|b| b.clone_ref(py));
-                self.hooks_inner = r.hooks_inner.clone_ref(py);
-                self.cookies_inner = r.cookies_inner.as_ref().map(|c| c.clone_ref(py));
-                self.body_position_inner = r.body_position_inner.as_ref().map(|p| p.clone_ref(py));
+            // Mimic upstream: self.__dict__.update(r.__dict__)
+            // Read fields from `result` using Python attribute access so it
+            // works for any returned type (PreparedRequest, subclass, or
+            // plain object). Most auth callables (HTTPBasicAuth) modify
+            // self_ref in-place and return it, so result IS self_ref.
+            // For auth callables that return a different object, we still
+            // pick up their attributes.
+            self.method = result.getattr("method")?.extract()?;
+            self.url = result.getattr("url")?.extract()?;
+            let headers_obj = result.getattr("headers")?;
+            if headers_obj.is_none() {
+                self.headers_inner = None;
+            } else if let Ok(cid) = headers_obj.cast::<CaseInsensitiveDict>() {
+                self.headers_inner = Some(cid.clone().unbind());
+            } else {
+                // Foreign object — convert via Python CaseInsensitiveDict
+                let cid_type = py
+                    .import("snekwest.structures")?
+                    .getattr("CaseInsensitiveDict")?;
+                let cid = cid_type.call1((&headers_obj,))?;
+                self.headers_inner = Some(cid.cast::<CaseInsensitiveDict>()?.clone().unbind());
             }
+            let body_obj = result.getattr("body")?;
+            self.body = if body_obj.is_none() {
+                None
+            } else {
+                Some(body_obj.unbind())
+            };
+            self.hooks_inner = result.getattr("hooks")?.unbind();
+            let cookies_obj = result.getattr("_cookies")?;
+            self.cookies_inner = if cookies_obj.is_none() {
+                None
+            } else {
+                Some(cookies_obj.unbind())
+            };
+            let body_pos_obj = result.getattr("_body_position")?;
+            self.body_position_inner = if body_pos_obj.is_none() {
+                None
+            } else {
+                Some(body_pos_obj.unbind())
+            };
 
             // Re-prepare content length
             if let Some(body) = &self.body {
