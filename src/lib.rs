@@ -1,8 +1,8 @@
 pub mod case_insensitive_dict;
-mod exceptions;
+pub mod exceptions;
 pub mod prepared_request;
-mod request_params;
-mod response;
+pub mod request_params;
+pub mod response;
 pub mod session;
 pub mod utils;
 
