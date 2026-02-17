@@ -737,7 +737,10 @@ impl Response {
             .getattr("JSONDecodeError")?;
 
         // Try encoding-specific parsing
-        let has_encoding = self.encoding_inner.is_some();
+        let has_encoding = self
+            .encoding_inner
+            .as_ref()
+            .is_some_and(|e| e.bind(py).is_truthy().unwrap_or(false));
         if !has_encoding && bytes.len() > 3 {
             let guess_fn = py.import("snekwest.utils")?.getattr("guess_json_utf")?;
             let enc: Option<String> = guess_fn.call1((PyBytes::new(py, &bytes),))?.extract()?;
