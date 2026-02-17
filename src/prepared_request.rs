@@ -307,10 +307,20 @@ impl PreparedRequest {
     // -- copy --
 
     fn copy(&self, py: Python<'_>) -> PyResult<PreparedRequest> {
-        let hooks = py
-            .import("snekwest.hooks")?
-            .call_method0("default_hooks")?
-            .unbind();
+        // Shallow-copy hooks: {event: list(callbacks) for event, callbacks in self.hooks.items()}
+        // Upstream does p.hooks = self.hooks (reference copy). We copy each list
+        // to avoid shared mutation, but do NOT deepcopy the callables themselves
+        // (they may contain unpicklable objects like _thread._local).
+        let orig_hooks = self.hooks_inner.bind(py);
+        let new_hooks = PyDict::new(py);
+        for item in orig_hooks.call_method0("items")?.try_iter()? {
+            let item = item?;
+            let key = item.get_item(0)?;
+            let val = item.get_item(1)?;
+            let copied_list = PyList::new(py, val.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+            new_hooks.set_item(&key, copied_list)?;
+        }
+        let hooks = new_hooks.into_any().unbind();
 
         let new_headers = match &self.headers_inner {
             Some(h) => {
