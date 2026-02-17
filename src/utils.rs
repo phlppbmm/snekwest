@@ -257,14 +257,23 @@ pub fn is_valid_cidr(string_network: &str) -> bool {
     }
 }
 
-#[pyfunction]
-pub fn dotted_netmask(mask: u32) -> String {
+/// Inner function: compute dotted netmask from prefix length.
+/// Returns `Err(msg)` for mask > 32, `Ok(ip_string)` otherwise.
+fn dotted_netmask_inner(mask: u32) -> Result<String, String> {
+    if mask > 32 {
+        return Err(format!("mask must be 0-32, got {mask}"));
+    }
     let bits: u32 = if mask == 0 {
         0
     } else {
         !((1u32 << (32 - mask)) - 1)
     };
-    Ipv4Addr::from(bits).to_string()
+    Ok(Ipv4Addr::from(bits).to_string())
+}
+
+#[pyfunction]
+pub fn dotted_netmask(mask: u32) -> PyResult<String> {
+    dotted_netmask_inner(mask).map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
 }
 
 #[pyfunction]
@@ -1217,11 +1226,39 @@ mod tests {
     }
 
     #[test]
-    fn test_dotted_netmask() {
-        assert_eq!(dotted_netmask(24), "255.255.255.0");
-        assert_eq!(dotted_netmask(8), "255.0.0.0");
-        assert_eq!(dotted_netmask(16), "255.255.0.0");
-        assert_eq!(dotted_netmask(32), "255.255.255.255");
+    fn test_dotted_netmask_inner_valid() {
+        assert_eq!(dotted_netmask_inner(0).unwrap(), "0.0.0.0");
+        assert_eq!(dotted_netmask_inner(8).unwrap(), "255.0.0.0");
+        assert_eq!(dotted_netmask_inner(16).unwrap(), "255.255.0.0");
+        assert_eq!(dotted_netmask_inner(24).unwrap(), "255.255.255.0");
+        assert_eq!(dotted_netmask_inner(32).unwrap(), "255.255.255.255");
+    }
+
+    #[test]
+    fn test_dotted_netmask_inner_boundary_zero() {
+        // mask=0 should return "0.0.0.0"
+        assert_eq!(dotted_netmask_inner(0).unwrap(), "0.0.0.0");
+    }
+
+    #[test]
+    fn test_dotted_netmask_inner_boundary_32() {
+        // mask=32 should return "255.255.255.255"
+        assert_eq!(dotted_netmask_inner(32).unwrap(), "255.255.255.255");
+    }
+
+    #[test]
+    fn test_dotted_netmask_inner_rejects_33() {
+        // mask=33 must return Err, not panic
+        let result = dotted_netmask_inner(33);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("0-32"));
+    }
+
+    #[test]
+    fn test_dotted_netmask_inner_rejects_large_values() {
+        // mask=64 and u32::MAX must return Err, not panic
+        assert!(dotted_netmask_inner(64).is_err());
+        assert!(dotted_netmask_inner(u32::MAX).is_err());
     }
 
     #[test]
