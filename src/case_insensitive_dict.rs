@@ -377,6 +377,19 @@ impl CaseInsensitiveDict {
     fn clear(&mut self) {
         self.store.clear();
     }
+
+    fn popitem(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self.store.pop() {
+            Some((_lower, (orig_key, val))) => {
+                let tuple = PyTuple::new(
+                    py,
+                    &[orig_key.into_pyobject(py)?.into_any(), val.into_bound(py)],
+                )?;
+                Ok(tuple.into_any().unbind())
+            }
+            None => Err(PyKeyError::new_err("popitem(): dictionary is empty")),
+        }
+    }
 }
 
 #[pyclass]
@@ -420,6 +433,21 @@ mod tests {
         // The real behavioral test (clear empties the store) runs in Group A.
         fn _assert_clear_signature(cid: &mut super::CaseInsensitiveDict) {
             cid.clear();
+        }
+    }
+
+    // -- popitem() tests (Issue #83) --
+
+    #[test]
+    fn test_popitem_method_exists() {
+        // Compile-time assertion: CaseInsensitiveDict has a popitem() method
+        // with signature fn(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>>.
+        // Returns a tuple of (original_key, value) or raises KeyError if empty.
+        fn _assert_popitem_signature(
+            cid: &mut super::CaseInsensitiveDict,
+            py: pyo3::Python<'_>,
+        ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
+            cid.popitem(py)
         }
     }
 }
