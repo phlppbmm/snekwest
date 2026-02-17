@@ -4,6 +4,235 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 // ============================================================================
+// LookupDict — Dictionary lookup object for status codes
+// ============================================================================
+
+/// Dictionary lookup object. Used for status codes.
+/// Mirrors requests' `LookupDict` but backed by a Rust HashMap.
+#[pyclass]
+pub struct LookupDict {
+    pub(crate) name: Option<String>,
+    pub(crate) data: HashMap<String, Py<PyAny>>,
+}
+
+#[pymethods]
+impl LookupDict {
+    #[new]
+    #[pyo3(signature = (name=None))]
+    fn new(name: Option<String>) -> Self {
+        LookupDict {
+            name,
+            data: HashMap::new(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<lookup '{}'>", self.name.as_deref().unwrap_or(""))
+    }
+
+    fn __getattr__(&self, py: Python<'_>, key: &str) -> Py<PyAny> {
+        if key == "name" {
+            return self
+                .name
+                .clone()
+                .into_pyobject(py)
+                .expect("name into_pyobject failed")
+                .into_any()
+                .unbind();
+        }
+        self.data
+            .get(key)
+            .map(|v| v.clone_ref(py))
+            .unwrap_or_else(|| py.None())
+    }
+
+    fn __setattr__(&mut self, key: String, value: Bound<'_, PyAny>) {
+        if key == "name" {
+            self.name = value.extract::<Option<String>>().ok().flatten();
+        } else {
+            self.data.insert(key, value.unbind());
+        }
+    }
+
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> Py<PyAny> {
+        self.data
+            .get(key)
+            .map(|v| v.clone_ref(py))
+            .unwrap_or_else(|| py.None())
+    }
+
+    #[pyo3(signature = (key, default=None))]
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> Py<PyAny> {
+        self.data
+            .get(key)
+            .map(|v| v.clone_ref(py))
+            .unwrap_or_else(|| default.unwrap_or_else(|| py.None()))
+    }
+}
+
+/// Raw status code data: (code, &[title_aliases]).
+/// Extracted so pure Rust tests can validate the mapping without the GIL.
+const STATUS_DATA: &[(i32, &[&str])] = &[
+    (100, &["continue"]),
+    (101, &["switching_protocols"]),
+    (102, &["processing", "early-hints"]),
+    (103, &["checkpoint"]),
+    (122, &["uri_too_long", "request_uri_too_long"]),
+    (
+        200,
+        &[
+            "ok", "okay", "all_ok", "all_okay", "all_good", "\\o/", "\u{2713}",
+        ],
+    ),
+    (201, &["created"]),
+    (202, &["accepted"]),
+    (
+        203,
+        &["non_authoritative_info", "non_authoritative_information"],
+    ),
+    (204, &["no_content"]),
+    (205, &["reset_content", "reset"]),
+    (206, &["partial_content", "partial"]),
+    (
+        207,
+        &[
+            "multi_status",
+            "multiple_status",
+            "multi_stati",
+            "multiple_stati",
+        ],
+    ),
+    (208, &["already_reported"]),
+    (226, &["im_used"]),
+    (300, &["multiple_choices"]),
+    (301, &["moved_permanently", "moved", "\\o-"]),
+    (302, &["found"]),
+    (303, &["see_other", "other"]),
+    (304, &["not_modified"]),
+    (305, &["use_proxy"]),
+    (306, &["switch_proxy"]),
+    (307, &["temporary_redirect", "temporary_moved", "temporary"]),
+    (308, &["permanent_redirect", "resume_incomplete", "resume"]),
+    (400, &["bad_request", "bad"]),
+    (401, &["unauthorized"]),
+    (402, &["payment_required", "payment"]),
+    (403, &["forbidden"]),
+    (404, &["not_found", "-o-"]),
+    (405, &["method_not_allowed", "not_allowed"]),
+    (406, &["not_acceptable"]),
+    (
+        407,
+        &[
+            "proxy_authentication_required",
+            "proxy_auth",
+            "proxy_authentication",
+        ],
+    ),
+    (408, &["request_timeout", "timeout"]),
+    (409, &["conflict"]),
+    (410, &["gone"]),
+    (411, &["length_required"]),
+    (412, &["precondition_failed", "precondition"]),
+    (413, &["request_entity_too_large", "content_too_large"]),
+    (414, &["request_uri_too_large", "uri_too_long"]),
+    (
+        415,
+        &["unsupported_media_type", "unsupported_media", "media_type"],
+    ),
+    (
+        416,
+        &[
+            "requested_range_not_satisfiable",
+            "requested_range",
+            "range_not_satisfiable",
+        ],
+    ),
+    (417, &["expectation_failed"]),
+    (418, &["im_a_teapot", "teapot", "i_am_a_teapot"]),
+    (421, &["misdirected_request"]),
+    (
+        422,
+        &[
+            "unprocessable_entity",
+            "unprocessable",
+            "unprocessable_content",
+        ],
+    ),
+    (423, &["locked"]),
+    (424, &["failed_dependency", "dependency"]),
+    (425, &["unordered_collection", "unordered", "too_early"]),
+    (426, &["upgrade_required", "upgrade"]),
+    (428, &["precondition_required", "precondition"]),
+    (429, &["too_many_requests", "too_many"]),
+    (431, &["header_fields_too_large", "fields_too_large"]),
+    (444, &["no_response", "none"]),
+    (449, &["retry_with", "retry"]),
+    (
+        450,
+        &["blocked_by_windows_parental_controls", "parental_controls"],
+    ),
+    (451, &["unavailable_for_legal_reasons", "legal_reasons"]),
+    (499, &["client_closed_request"]),
+    (
+        500,
+        &["internal_server_error", "server_error", "/o\\", "\u{2717}"],
+    ),
+    (501, &["not_implemented"]),
+    (502, &["bad_gateway"]),
+    (503, &["service_unavailable", "unavailable"]),
+    (504, &["gateway_timeout"]),
+    (505, &["http_version_not_supported", "http_version"]),
+    (506, &["variant_also_negotiates"]),
+    (507, &["insufficient_storage"]),
+    (509, &["bandwidth_limit_exceeded", "bandwidth"]),
+    (510, &["not_extended"]),
+    (
+        511,
+        &[
+            "network_authentication_required",
+            "network_auth",
+            "network_authentication",
+        ],
+    ),
+];
+
+/// Build a flat `HashMap<String, i32>` from `STATUS_DATA`, including uppercase
+/// variants for titles that don't start with `\` or `/`.
+/// This is the pure-Rust core that can be tested without the GIL.
+fn build_status_map() -> HashMap<String, i32> {
+    let mut map = HashMap::new();
+    for &(code, titles) in STATUS_DATA {
+        for title in titles {
+            map.insert(title.to_string(), code);
+            if !title.starts_with('\\') && !title.starts_with('/') {
+                map.insert(title.to_uppercase(), code);
+            }
+        }
+    }
+    map
+}
+
+/// Construct a pre-populated `LookupDict` with all HTTP status code mappings.
+#[pyfunction]
+pub fn _init_status_codes() -> LookupDict {
+    let mut codes = LookupDict::new(Some("status_codes".to_string()));
+    let status_map = build_status_map();
+
+    Python::attach(|py| {
+        for (key, code) in &status_map {
+            let code_obj: Py<PyAny> = code
+                .into_pyobject(py)
+                .expect("i32 into_pyobject failed")
+                .into_any()
+                .unbind();
+            codes.data.insert(key.clone(), code_obj);
+        }
+    });
+
+    codes
+}
+
+// ============================================================================
 // 2a: IP/CIDR functions
 // ============================================================================
 
@@ -1468,5 +1697,42 @@ mod tests {
             false,
             " example.com , other.com "
         ));
+    }
+
+    // -- LookupDict / status codes tests --
+
+    #[test]
+    fn test_build_status_map_keys() {
+        let map = build_status_map();
+        // Check that data was populated
+        assert!(map.contains_key("ok"));
+        assert!(map.contains_key("OK"));
+        assert!(map.contains_key("not_found"));
+        assert!(map.contains_key("NOT_FOUND"));
+        assert!(map.contains_key("teapot"));
+        // Special chars should not have uppercase
+        assert!(map.contains_key("\\o/"));
+        assert!(!map.contains_key("\\O/"));
+        assert!(map.contains_key("/o\\"));
+        assert!(!map.contains_key("/O\\"));
+    }
+
+    #[test]
+    fn test_build_status_map_values() {
+        let map = build_status_map();
+        assert_eq!(map.get("ok"), Some(&200));
+        assert_eq!(map.get("OK"), Some(&200));
+        assert_eq!(map.get("not_found"), Some(&404));
+        assert_eq!(map.get("NOT_FOUND"), Some(&404));
+        assert_eq!(map.get("teapot"), Some(&418));
+        assert_eq!(map.get("TEAPOT"), Some(&418));
+        assert_eq!(map.get("too_early"), Some(&425));
+        assert_eq!(map.get("TOO_EARLY"), Some(&425));
+        assert_eq!(map.get("temporary_redirect"), Some(&307));
+        assert_eq!(map.get("permanent_redirect"), Some(&308));
+        assert_eq!(map.get("moved"), Some(&301));
+        assert_eq!(map.get("found"), Some(&302));
+        assert_eq!(map.get("see_other"), Some(&303));
+        assert_eq!(map.get("bad_gateway"), Some(&502));
     }
 }
