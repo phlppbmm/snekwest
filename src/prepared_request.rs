@@ -4,6 +4,122 @@ use pyo3::types::{IntoPyDict, PyBytes, PyDict, PyList, PyString, PyTuple};
 
 use crate::case_insensitive_dict::CaseInsensitiveDict;
 
+/// Parse a netloc string into (auth, host, port) without normalization.
+/// Handles IPv6 brackets, user:pass@host, and host:port patterns.
+fn parse_netloc(netloc: &str) -> (Option<String>, Option<String>, Option<u16>) {
+    if netloc.is_empty() {
+        return (None, None, None);
+    }
+
+    let (auth, host_port) = match netloc.rfind('@') {
+        Some(pos) => (Some(netloc[..pos].to_string()), &netloc[pos + 1..]),
+        None => (None, netloc),
+    };
+
+    let (host, port) = if host_port.starts_with('[') {
+        // IPv6: [addr]:port or [addr]
+        match host_port.find("]:") {
+            Some(pos) => {
+                let h = &host_port[..pos + 1];
+                let p = host_port[pos + 2..].parse::<u16>().ok();
+                (Some(h.to_string()), p)
+            }
+            None => (Some(host_port.to_string()), None),
+        }
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(port_num) => (Some(h.to_string()), Some(port_num)),
+                Err(_) => (Some(host_port.to_string()), None),
+            },
+            None => (Some(host_port.to_string()), None),
+        }
+    };
+
+    (auth, host, port)
+}
+
+/// URL components extracted by parse_url_raw.
+struct UrlParts {
+    scheme: Option<String>,
+    auth: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    path: Option<String>,
+    query: Option<String>,
+    fragment: Option<String>,
+}
+
+/// Parse a URL into components without normalization.
+fn parse_url_raw(url: &str) -> UrlParts {
+    // 1. Extract fragment (everything after first '#')
+    let (url_no_frag, fragment) = match url.find('#') {
+        Some(pos) => {
+            let f = &url[pos + 1..];
+            (
+                &url[..pos],
+                if f.is_empty() {
+                    None
+                } else {
+                    Some(f.to_string())
+                },
+            )
+        }
+        None => (url, None),
+    };
+
+    // 2. Extract scheme (everything before '://')
+    let (scheme, rest) = match url_no_frag.find("://") {
+        Some(pos) => (
+            Some(url_no_frag[..pos].to_string()),
+            &url_no_frag[pos + 3..],
+        ),
+        None => (None, url_no_frag),
+    };
+
+    // 3. Extract netloc (ends at first '/' or '?') and remaining path+query
+    let (netloc_str, after_netloc) = if scheme.is_some() {
+        let end = rest.find(['/', '?']).unwrap_or(rest.len());
+        (&rest[..end], &rest[end..])
+    } else {
+        ("", rest)
+    };
+
+    // 4. Split path and query
+    let (path_str, query) = match after_netloc.find('?') {
+        Some(pos) => {
+            let q = &after_netloc[pos + 1..];
+            (
+                &after_netloc[..pos],
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.to_string())
+                },
+            )
+        }
+        None => (after_netloc, None),
+    };
+    let path = if path_str.is_empty() {
+        None
+    } else {
+        Some(path_str.to_string())
+    };
+
+    // 5. Parse netloc into auth, host, port
+    let (auth, host, port) = parse_netloc(netloc_str);
+
+    UrlParts {
+        scheme,
+        auth,
+        host,
+        port,
+        path,
+        query,
+        fragment,
+    }
+}
+
 /// Extract path + query from a URL string using pure Rust.
 fn path_url_from_str(url_str: &str) -> String {
     match url::Url::parse(url_str) {
@@ -411,96 +527,16 @@ impl PreparedRequest {
             return Ok(());
         }
 
-        // Parse URL using pure Rust string parsing (no normalization, matches urlparse behavior)
-        let (scheme, auth, host, port, path, query, fragment) = {
-            // 1. Extract fragment (everything after first '#')
-            let (url_no_frag, fragment) = match url_str.find('#') {
-                Some(pos) => {
-                    let f = &url_str[pos + 1..];
-                    (
-                        &url_str[..pos],
-                        if f.is_empty() {
-                            None
-                        } else {
-                            Some(f.to_string())
-                        },
-                    )
-                }
-                None => (url_str.as_str(), None),
-            };
-
-            // 2. Extract scheme (everything before '://')
-            let (scheme, rest) = match url_no_frag.find("://") {
-                Some(pos) => (
-                    Some(url_no_frag[..pos].to_string()),
-                    &url_no_frag[pos + 3..],
-                ),
-                None => (None, url_no_frag),
-            };
-
-            // 3. Extract netloc (ends at first '/' or '?') and remaining path+query
-            let (netloc_str, after_netloc) = if scheme.is_some() {
-                let end = rest.find(['/', '?']).unwrap_or(rest.len());
-                (&rest[..end], &rest[end..])
-            } else {
-                ("", rest)
-            };
-
-            // 4. Split path and query
-            let (path_str, query) = match after_netloc.find('?') {
-                Some(pos) => {
-                    let q = &after_netloc[pos + 1..];
-                    (
-                        &after_netloc[..pos],
-                        if q.is_empty() {
-                            None
-                        } else {
-                            Some(q.to_string())
-                        },
-                    )
-                }
-                None => (after_netloc, None),
-            };
-            let path = if path_str.is_empty() {
-                None
-            } else {
-                Some(path_str.to_string())
-            };
-
-            // 5. Parse netloc into auth, host, port
-            let (auth, host_port) = match netloc_str.rfind('@') {
-                Some(pos) => (Some(netloc_str[..pos].to_string()), &netloc_str[pos + 1..]),
-                None => (None, netloc_str),
-            };
-
-            let (host, port) = if host_port.starts_with('[') {
-                // IPv6: [addr]:port or [addr]
-                match host_port.find("]:") {
-                    Some(pos) => {
-                        let h = &host_port[..pos + 1];
-                        let p = host_port[pos + 2..].parse::<u16>().ok();
-                        (Some(h.to_string()), p)
-                    }
-                    None => (Some(host_port.to_string()), None),
-                }
-            } else {
-                match host_port.rsplit_once(':') {
-                    Some((h, p)) => match p.parse::<u16>() {
-                        Ok(port_num) => (Some(h.to_string()), Some(port_num)),
-                        Err(_) => (Some(host_port.to_string()), None),
-                    },
-                    None => {
-                        if host_port.is_empty() {
-                            (None, None)
-                        } else {
-                            (Some(host_port.to_string()), None)
-                        }
-                    }
-                }
-            };
-
-            (scheme, auth, host, port, path, query, fragment)
-        };
+        // Parse URL using pure Rust string parsing (no normalization)
+        let UrlParts {
+            scheme,
+            auth,
+            host,
+            port,
+            path,
+            query,
+            fragment,
+        } = parse_url_raw(&url_str);
 
         let scheme = match scheme {
             Some(s) if !s.is_empty() => s,
@@ -1201,5 +1237,176 @@ mod tests {
         let cookies_msg = "Cookies not initialized. Call prepare_cookies() first.";
         assert!(headers_msg.contains("prepare_headers"));
         assert!(cookies_msg.contains("prepare_cookies"));
+    }
+
+    // ---- parse_netloc tests ----
+
+    #[test]
+    fn test_parse_netloc_plain_host() {
+        let (auth, host, port) = super::parse_netloc("example.com");
+        assert_eq!(auth, None);
+        assert_eq!(host, Some("example.com".into()));
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn test_parse_netloc_host_with_port() {
+        let (auth, host, port) = super::parse_netloc("example.com:443");
+        assert_eq!(auth, None);
+        assert_eq!(host, Some("example.com".into()));
+        assert_eq!(port, Some(443));
+    }
+
+    #[test]
+    fn test_parse_netloc_auth_host() {
+        let (auth, host, port) = super::parse_netloc("user:pass@example.com");
+        assert_eq!(auth, Some("user:pass".into()));
+        assert_eq!(host, Some("example.com".into()));
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn test_parse_netloc_auth_host_port() {
+        let (auth, host, port) = super::parse_netloc("user:pass@example.com:8080");
+        assert_eq!(auth, Some("user:pass".into()));
+        assert_eq!(host, Some("example.com".into()));
+        assert_eq!(port, Some(8080));
+    }
+
+    #[test]
+    fn test_parse_netloc_user_only_auth() {
+        let (auth, host, port) = super::parse_netloc("user@example.com");
+        assert_eq!(auth, Some("user".into()));
+        assert_eq!(host, Some("example.com".into()));
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn test_parse_netloc_ipv6() {
+        let (auth, host, port) = super::parse_netloc("[::1]");
+        assert_eq!(auth, None);
+        assert_eq!(host, Some("[::1]".into()));
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn test_parse_netloc_ipv6_with_port() {
+        let (auth, host, port) = super::parse_netloc("[::1]:8080");
+        assert_eq!(auth, None);
+        assert_eq!(host, Some("[::1]".into()));
+        assert_eq!(port, Some(8080));
+    }
+
+    #[test]
+    fn test_parse_netloc_ipv6_full_with_port() {
+        let (auth, host, port) =
+            super::parse_netloc("[1200:0000:ab00:1234:0000:2552:7777:1313]:12345");
+        assert_eq!(auth, None);
+        assert_eq!(
+            host,
+            Some("[1200:0000:ab00:1234:0000:2552:7777:1313]".into())
+        );
+        assert_eq!(port, Some(12345));
+    }
+
+    #[test]
+    fn test_parse_netloc_auth_ipv6_port() {
+        let (auth, host, port) = super::parse_netloc("user@[::1]:8080");
+        assert_eq!(auth, Some("user".into()));
+        assert_eq!(host, Some("[::1]".into()));
+        assert_eq!(port, Some(8080));
+    }
+
+    #[test]
+    fn test_parse_netloc_empty() {
+        let (auth, host, port) = super::parse_netloc("");
+        assert_eq!(auth, None);
+        assert_eq!(host, None);
+        assert_eq!(port, None);
+    }
+
+    // ---- parse_url_raw tests ----
+
+    #[test]
+    fn test_parse_url_raw_full() {
+        let p = super::parse_url_raw("http://user:pass@example.com:8080/path?q=1#frag");
+        assert_eq!(p.scheme, Some("http".into()));
+        assert_eq!(p.auth, Some("user:pass".into()));
+        assert_eq!(p.host, Some("example.com".into()));
+        assert_eq!(p.port, Some(8080));
+        assert_eq!(p.path, Some("/path".into()));
+        assert_eq!(p.query, Some("q=1".into()));
+        assert_eq!(p.fragment, Some("frag".into()));
+    }
+
+    #[test]
+    fn test_parse_url_raw_simple() {
+        let p = super::parse_url_raw("http://example.com/");
+        assert_eq!(p.scheme, Some("http".into()));
+        assert_eq!(p.host, Some("example.com".into()));
+        assert_eq!(p.path, Some("/".into()));
+    }
+
+    #[test]
+    fn test_parse_url_raw_no_path() {
+        let p = super::parse_url_raw("http://example.com");
+        assert_eq!(p.scheme, Some("http".into()));
+        assert_eq!(p.host, Some("example.com".into()));
+        assert_eq!(p.path, None);
+    }
+
+    #[test]
+    fn test_parse_url_raw_query_no_path() {
+        let p = super::parse_url_raw("http://example.com?foo=bar");
+        assert_eq!(p.scheme, Some("http".into()));
+        assert_eq!(p.host, Some("example.com".into()));
+        assert_eq!(p.path, None);
+        assert_eq!(p.query, Some("foo=bar".into()));
+    }
+
+    #[test]
+    fn test_parse_url_raw_no_scheme() {
+        let p = super::parse_url_raw("example.com/path");
+        assert_eq!(p.scheme, None);
+    }
+
+    #[test]
+    fn test_parse_url_raw_ipv6_preserves_original() {
+        let p = super::parse_url_raw("http://[1200:0000:ab00:1234:0000:2552:7777:1313]:12345/");
+        assert_eq!(
+            p.host,
+            Some("[1200:0000:ab00:1234:0000:2552:7777:1313]".into())
+        );
+        assert_eq!(p.port, Some(12345));
+    }
+
+    // ---- path_url_from_str tests ----
+
+    #[test]
+    fn test_path_url_with_query() {
+        assert_eq!(
+            super::path_url_from_str("http://example.com/path?q=1"),
+            "/path?q=1"
+        );
+    }
+
+    #[test]
+    fn test_path_url_no_query() {
+        assert_eq!(super::path_url_from_str("http://example.com/path"), "/path");
+    }
+
+    #[test]
+    fn test_path_url_root() {
+        assert_eq!(super::path_url_from_str("http://example.com/"), "/");
+    }
+
+    #[test]
+    fn test_path_url_no_path() {
+        assert_eq!(super::path_url_from_str("http://example.com"), "/");
+    }
+
+    #[test]
+    fn test_path_url_invalid() {
+        assert_eq!(super::path_url_from_str("not-a-url"), "/");
     }
 }
