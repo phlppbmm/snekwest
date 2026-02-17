@@ -124,6 +124,15 @@ impl CaseInsensitiveDict {
         ))
     }
 
+    /// Build a temporary PyDict from the store for view methods.
+    fn to_pydict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (_lower, (orig, val)) in &self.store {
+            dict.set_item(orig, val.bind(py))?;
+        }
+        Ok(dict)
+    }
+
     fn update_from_kwargs(&mut self, py: Python<'_>, kwargs: &Bound<'_, PyDict>) -> PyResult<()> {
         for (k, v) in kwargs.iter() {
             let key_str: String = k.extract()?;
@@ -339,30 +348,19 @@ impl CaseInsensitiveDict {
         }
     }
 
-    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.store.values().map(|(orig, _)| orig.clone()).collect();
-        PyList::new(py, &keys)
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dict = self.to_pydict(py)?;
+        dict.call_method0("keys")
     }
 
-    fn values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let vals: Vec<&Py<PyAny>> = self.store.values().map(|(_, val)| val).collect();
-        let list = PyList::empty(py);
-        for v in vals {
-            list.append(v.bind(py))?;
-        }
-        Ok(list)
+    fn values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dict = self.to_pydict(py)?;
+        dict.call_method0("values")
     }
 
-    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let list = PyList::empty(py);
-        for (_lower, (orig, val)) in &self.store {
-            let tuple = PyTuple::new(
-                py,
-                &[orig.into_pyobject(py)?.into_any(), val.bind(py).clone()],
-            )?;
-            list.append(tuple)?;
-        }
-        Ok(list)
+    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dict = self.to_pydict(py)?;
+        dict.call_method0("items")
     }
 
     fn lower_items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
