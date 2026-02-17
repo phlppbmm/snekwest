@@ -18,11 +18,6 @@ pub fn make_exception(py: Python<'_>, class_name: &str, msg: String) -> PyErr {
     }
 }
 
-/// Convenience function to raise a specific snekwest exception from Rust.
-pub fn raise_exception(py: Python<'_>, class_name: &str, msg: String) -> PyErr {
-    make_exception(py, class_name, msg)
-}
-
 /// Create a timeout exception with nested args structure.
 /// The outer exception's args[0] is an IOError whose args[0] is the message.
 /// This matches requests' pattern: ReadTimeout(urllib3.ReadTimeoutError(msg))
