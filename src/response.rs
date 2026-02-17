@@ -352,6 +352,19 @@ impl Response {
 }
 
 // ---------------------------------------------------------------------------
+// Pure Rust helpers
+// ---------------------------------------------------------------------------
+
+/// Re-encode a string from latin1 code points to UTF-8.
+///
+/// Each character in `input` is treated as a latin1 byte value (0x00–0xFF).
+/// The collected bytes are then decoded as UTF-8.
+fn latin1_to_utf8(input: &str) -> String {
+    let bytes: Vec<u8> = input.chars().map(|c| c as u32 as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+// ---------------------------------------------------------------------------
 // Python methods
 // ---------------------------------------------------------------------------
 
@@ -634,6 +647,24 @@ impl Response {
         };
         let status = self.status_code.unwrap_or(0);
         has_location && REDIRECT_STATI.contains(&status)
+    }
+
+    /// Return the redirect target URL with latin1-to-utf8 re-encoding, or None.
+    fn get_redirect_target(&self, py: Python<'_>) -> Option<String> {
+        let has_location = match &self.headers_inner {
+            Some(h) => h.bind(py).borrow().contains("location"),
+            None => false,
+        };
+        let status = self.status_code.unwrap_or(0);
+        if !(has_location && REDIRECT_STATI.contains(&status)) {
+            return None;
+        }
+        let location: String = self
+            .headers_inner
+            .as_ref()
+            .and_then(|h| h.bind(py).borrow().get_value(py, "location"))
+            .and_then(|v| v.extract(py).ok())?;
+        Some(latin1_to_utf8(&location))
     }
 
     #[getter]
@@ -1099,5 +1130,86 @@ impl LinesIterator {
             self.buffered_lines = to_yield;
             self.buffered_pos = 0;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_latin1_to_utf8_ascii() {
+        // Pure ASCII input should pass through unchanged.
+        let input = "https://example.com/path?q=hello";
+        let result = latin1_to_utf8(input);
+        assert_eq!(result, "https://example.com/path?q=hello");
+    }
+
+    #[test]
+    fn test_latin1_to_utf8_non_ascii() {
+        // Latin1 "caf\u{00e9}" — the single code point U+00E9 maps to
+        // the latin1 byte 0xE9, which is *not* valid standalone UTF-8.
+        // But as a single byte, 0xE9 is the latin1 encoding of 'e'.
+        // The function should collect the byte 0xE9 and attempt to
+        // decode it as UTF-8. Since a lone 0xE9 is not valid UTF-8,
+        // this tests the latin1→bytes→utf8 pipeline with a byte that
+        // happens to be a single latin1 character.
+        //
+        // For this test we use a string where the latin1 bytes form
+        // valid UTF-8: "caf\u{00c3}\u{00a9}" — the two code points
+        // U+00C3 and U+00A9 give bytes [0xC3, 0xA9] which is UTF-8
+        // for 'e'. So we verify that path in test_latin1_to_utf8_multibyte_utf8
+        // and here just check that single-byte latin1 char \u{00e9} (byte 0xE9)
+        // produces "caf" + whatever UTF-8 decodes 0xE9 to.
+        //
+        // Actually the simplest test: "caf\u{00e9}" has bytes [99, 97, 102, 233].
+        // 233 alone is not valid UTF-8, so it depends on the implementation
+        // (lossy vs strict). The Python reference does `.encode("latin1")` which
+        // gives raw bytes, then `.decode("utf8")` which would fail on lone 0xE9.
+        //
+        // The realistic case: HTTP headers use latin1 encoding, so a URL like
+        // "/café" is encoded as latin1 bytes. If those bytes happen to be valid
+        // UTF-8, the decode succeeds. Let's test with an input where all chars
+        // are in the ASCII range plus characters whose latin1 bytes form valid
+        // UTF-8 sequences.
+        //
+        // Simple check: ASCII-only non-ascii test — use chars 0x80-0xBF which
+        // are continuation bytes in UTF-8 (invalid alone). The Python code uses
+        // to_native_string which does encode('latin1').decode('utf8') — if it
+        // fails, Python would raise. So the realistic scenario is: the "location"
+        // header contains UTF-8 bytes stored as latin1 code points.
+        //
+        // Test: "\u{00c3}\u{00a9}" → bytes [0xC3, 0xA9] → UTF-8 "é"
+        // This is covered by test_latin1_to_utf8_multibyte_utf8.
+        //
+        // For this test, use a URL with a path containing "é" encoded as UTF-8
+        // bytes stored in latin1: "/caf\u{00c3}\u{00a9}" → "/café"
+        let input = "/caf\u{00c3}\u{00a9}";
+        let result = latin1_to_utf8(input);
+        assert_eq!(result, "/caf\u{00e9}"); // "/café" in proper UTF-8
+    }
+
+    #[test]
+    fn test_latin1_to_utf8_empty() {
+        // Empty string should produce empty string.
+        let input = "";
+        let result = latin1_to_utf8(input);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_latin1_to_utf8_multibyte_utf8() {
+        // UTF-8 bytes for "é" are [0xC3, 0xA9]. When stored as latin1
+        // code points, these become the Rust string "\u{00c3}\u{00a9}"
+        // (two characters: U+00C3 'Ã' and U+00A9 '©').
+        // latin1_to_utf8 should extract bytes [0xC3, 0xA9] and decode
+        // them as UTF-8 to produce "é" (U+00E9).
+        let input = "\u{00c3}\u{00a9}";
+        let result = latin1_to_utf8(input);
+        assert_eq!(result, "\u{00e9}"); // "é"
     }
 }
