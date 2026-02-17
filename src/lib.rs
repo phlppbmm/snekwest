@@ -3,7 +3,7 @@ mod exceptions;
 pub mod prepared_request;
 mod request_params;
 mod response;
-mod session;
+pub mod session;
 pub mod utils;
 
 use case_insensitive_dict::{CaseInsensitiveDict, CaseInsensitiveDictIter};
@@ -22,6 +22,7 @@ fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PreparedRequest>()?;
     m.add_class::<ContentIterator>()?;
     m.add_class::<LinesIterator>()?;
+    m.add_class::<utils::LookupDict>()?;
 
     // Utility functions
     m.add_function(wrap_pyfunction!(utils::is_ipv4_address, m)?)?;
@@ -39,6 +40,8 @@ fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(utils::_parse_content_type_header, m)?)?;
     m.add_function(wrap_pyfunction!(utils::guess_json_utf, m)?)?;
     m.add_function(wrap_pyfunction!(utils::select_proxy, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::should_bypass_proxies_core, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::request_url, m)?)?;
     m.add_function(wrap_pyfunction!(utils::check_header_validity, m)?)?;
     m.add_function(wrap_pyfunction!(utils::to_native_string, m)?)?;
     m.add_function(wrap_pyfunction!(utils::parse_list_header, m)?)?;
@@ -47,6 +50,11 @@ fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(utils::merge_setting, m)?)?;
     m.add_function(wrap_pyfunction!(utils::default_user_agent, m)?)?;
     m.add_function(wrap_pyfunction!(utils::default_headers, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::_init_status_codes, m)?)?;
     m.add("DEFAULT_ACCEPT_ENCODING", utils::DEFAULT_ACCEPT_ENCODING)?;
+
+    // Session utility functions
+    m.add_function(wrap_pyfunction!(session::should_strip_auth, m)?)?;
+    m.add_function(wrap_pyfunction!(session::rebuild_method, m)?)?;
     Ok(())
 }

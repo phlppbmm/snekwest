@@ -60,6 +60,8 @@ else:
 
 
 from ._bindings import merge_setting  # noqa: F811
+from ._bindings import should_strip_auth as _should_strip_auth  # noqa: F811
+from ._bindings import rebuild_method as _rebuild_method
 
 
 def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
@@ -78,27 +80,7 @@ class SessionRedirectMixin:
 
     def should_strip_auth(self, old_url, new_url):
         """Decide whether Authorization header should be removed when redirecting"""
-        old_parsed = urlparse(old_url)
-        new_parsed = urlparse(new_url)
-        if old_parsed.hostname != new_parsed.hostname:
-            return True
-        if (
-            old_parsed.scheme == "http"
-            and old_parsed.port in (80, None)
-            and new_parsed.scheme == "https"
-            and new_parsed.port in (443, None)
-        ):
-            return False
-        changed_port = old_parsed.port != new_parsed.port
-        changed_scheme = old_parsed.scheme != new_parsed.scheme
-        default_port = (DEFAULT_PORTS.get(old_parsed.scheme, None), None)
-        if (
-            not changed_scheme
-            and old_parsed.port in default_port
-            and new_parsed.port in default_port
-        ):
-            return False
-        return changed_port or changed_scheme
+        return _should_strip_auth(old_url, new_url)
 
     def resolve_redirects(
         self,
@@ -214,14 +196,9 @@ class SessionRedirectMixin:
     def rebuild_method(self, prepared_request, response):
         """When being redirected we may want to change the method of the request
         based on certain specs or browser behavior."""
-        method = prepared_request.method
-        if response.status_code == codes.see_other and method != "HEAD":
-            method = "GET"
-        if response.status_code == codes.found and method != "HEAD":
-            method = "GET"
-        if response.status_code == codes.moved and method == "POST":
-            method = "GET"
-        prepared_request.method = method
+        prepared_request.method = _rebuild_method(
+            prepared_request.method, response.status_code
+        )
 
 
 class Session(SessionRedirectMixin, _RustSession):

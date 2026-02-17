@@ -18,8 +18,10 @@ the names are allowed. For example, ``codes.ok``, ``codes.OK``, and
 ``codes.okay`` all correspond to the HTTP status code 200.
 """
 
-from .structures import LookupDict
+from .structures import LookupDict  # noqa: F401
+from ._bindings import _init_status_codes
 
+# Keep _codes dict for docstring generation
 _codes = {
     # Informational.
     100: ("continue",),
@@ -50,7 +52,7 @@ _codes = {
         "permanent_redirect",
         "resume_incomplete",
         "resume",
-    ),  # "resume" and "resume_incomplete" to be removed in 3.0
+    ),
     # Client Error.
     400: ("bad_request", "bad"),
     401: ("unauthorized",),
@@ -103,16 +105,11 @@ _codes = {
     511: ("network_authentication_required", "network_auth", "network_authentication"),
 }
 
-codes = LookupDict(name="status_codes")
+# Construct codes from Rust with all mappings pre-populated
+codes = _init_status_codes()
 
 
 def _init():
-    for code, titles in _codes.items():
-        for title in titles:
-            setattr(codes, title, code)
-            if not title.startswith(("\\", "/")):
-                setattr(codes, title.upper(), code)
-
     def doc(code):
         names = ", ".join(f"``{n}``" for n in _codes[code])
         return "* %d: %s" % (code, names)
