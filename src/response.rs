@@ -299,7 +299,17 @@ impl Response {
         let mut all_bytes: Vec<u8> = Vec::new();
         loop {
             let chunk_obj = raw.bind(py).call_method1("read", (CONTENT_CHUNK_SIZE,))?;
-            let chunk: Vec<u8> = chunk_obj.extract()?;
+            // raw.read() may return bytes (normal) or str (e.g. StringIO mock)
+            let chunk: Vec<u8> = if let Ok(b) = chunk_obj.extract::<Vec<u8>>() {
+                b
+            } else if let Ok(s) = chunk_obj.extract::<String>() {
+                if s.is_empty() {
+                    break;
+                }
+                s.into_bytes()
+            } else {
+                break;
+            };
             if chunk.is_empty() {
                 break;
             }
@@ -794,29 +804,25 @@ impl Response {
         this.raise_for_status_impl(py, Some(slf.as_any().clone().unbind()))
     }
 
-    #[pyo3(signature = (chunk_size=None, decode_unicode=false))]
+    /// Iterate over response content in chunks.
+    ///
+    /// ``chunk_size``: ``int`` (default 1) or ``None`` (all at once).
+    /// Passing a non-int type raises ``TypeError``.
+    ///
+    /// PyO3's ``Option`` conflates omitted and explicit ``None``, so we use
+    /// ``Option<isize>`` where ``None`` → no chunking, ``Some(n)`` → n bytes.
+    /// The Python-level default is 1 (matching upstream ``requests``).
+    #[pyo3(signature = (chunk_size=1, decode_unicode=false))]
     fn iter_content(
         &mut self,
         py: Python<'_>,
-        chunk_size: Option<&Bound<'_, PyAny>>,
+        chunk_size: Option<isize>,
         decode_unicode: bool,
     ) -> PyResult<Py<PyAny>> {
-        // Validate chunk_size type (matching upstream TypeError message)
-        let cs: Option<usize> = match chunk_size {
-            None => Some(1), // default
-            Some(obj) => {
-                if obj.is_none() {
-                    None
-                } else if let Ok(val) = obj.extract::<usize>() {
-                    Some(val)
-                } else {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                        "chunk_size must be an int, it is instead a {}.",
-                        obj.get_type()
-                    )));
-                }
-            }
-        };
+        // Validate chunk_size: must be int or None.
+        // PyO3 handles the type check: only int and None reach here, anything else
+        // (str, float, etc.) raises TypeError automatically.
+        let cs: Option<usize> = chunk_size.map(|n| n as usize);
 
         // Check StreamConsumedError
         if self.content_consumed && !self.content_loaded {
@@ -844,7 +850,7 @@ impl Response {
                 content: None,
                 pos: 0,
                 raw: self.raw_inner.as_ref().map(|r| r.clone_ref(py)),
-                chunk_size: cs.unwrap_or(1),
+                chunk_size: cs.unwrap_or(0),
                 done: false,
             }
         };
@@ -876,8 +882,7 @@ impl Response {
         delimiter: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         // Get the content iterator
-        let cs_obj = chunk_size.into_pyobject(py)?;
-        let content_iter = self.iter_content(py, Some(&cs_obj.into_any()), decode_unicode)?;
+        let content_iter = self.iter_content(py, Some(chunk_size as isize), decode_unicode)?;
 
         let iter = LinesIterator {
             content_iter,
@@ -924,8 +929,7 @@ impl Response {
     }
 
     fn __iter__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let cs_obj = 128usize.into_pyobject(py)?;
-        self.iter_content(py, Some(&cs_obj.into_any()), false)
+        self.iter_content(py, Some(128), false)
     }
 
     fn __repr__(&self) -> String {
@@ -1041,11 +1045,28 @@ impl ContentIterator {
             Ok(Some(PyBytes::new(py, chunk).into_any().unbind()))
         } else if let Some(ref raw) = self.raw {
             // Streaming from raw
-            let chunk = raw.bind(py).call_method1("read", (self.chunk_size,))?;
-            let chunk_bytes: Vec<u8> = chunk.extract()?;
+            let chunk = if self.chunk_size == 0 {
+                // chunk_size=None: read all remaining content at once
+                raw.bind(py).call_method0("read")?
+            } else {
+                raw.bind(py).call_method1("read", (self.chunk_size,))?
+            };
+            // raw.read() may return bytes (normal) or str (e.g. StringIO mock)
+            let chunk_bytes: Vec<u8> = if let Ok(b) = chunk.extract::<Vec<u8>>() {
+                b
+            } else if let Ok(s) = chunk.extract::<String>() {
+                s.into_bytes()
+            } else {
+                self.done = true;
+                return Ok(None);
+            };
             if chunk_bytes.is_empty() {
                 self.done = true;
                 return Ok(None);
+            }
+            // After reading all at once, mark done so next call returns None
+            if self.chunk_size == 0 {
+                self.done = true;
             }
             Ok(Some(PyBytes::new(py, &chunk_bytes).into_any().unbind()))
         } else {

@@ -6,6 +6,7 @@ any downstream conftest.py files are loaded.
 Group B tests (Python-internal tests) are skipped via pytest_collection_modifyitems.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -72,38 +73,21 @@ for _name, _mod in list(sys.modules.items()):
 _GROUP_B_TESTS = frozenset(
     {
         # test_requests.py -- Python-internal tests
-        "TestRequests::test_cookielib_cookiejar_on_redirect",
+        # (2 cookie handling tests unskipped in #45)
         "TestRequests::test_https_warnings",
-        "TestRequests::test_cookie_policy_copy",
-        "TestRequests::test_empty_response_has_content_none",
         "TestRequests::test_response_is_iterable",
-        "TestRequests::test_response_decode_unicode",
-        "TestRequests::test_response_chunk_size_type",
         "TestRequests::test_iter_content_wraps_exceptions",
         "TestRequests::test_request_and_response_are_pickleable",
         "TestRequests::test_prepared_request_is_pickleable",
         "TestRequests::test_prepared_request_with_file_is_pickleable",
         "TestRequests::test_prepared_request_with_hook_is_pickleable",
         "TestRequests::test_session_pickling",
-        "TestRequests::test_transport_adapter_ordering",
-        "TestRequests::test_session_get_adapter_prefix_matching",
-        "TestRequests::test_session_get_adapter_prefix_matching_mixed_case",
-        "TestRequests::test_session_get_adapter_prefix_matching_is_case_insensitive",
-        "TestRequests::test_session_get_adapter_prefix_with_trailing_slash",
-        "TestRequests::test_session_get_adapter_prefix_without_trailing_slash",
-        "TestRequests::test_prepare_body_position_non_stream",
-        "TestRequests::test_rewind_body",
-        "TestRequests::test_rewind_body_no_seek",
-        "TestRequests::test_rewind_body_failed_seek",
-        "TestRequests::test_rewind_body_failed_tell",
+        # (5 body position & rewind tests unskipped in #42)
         "TestRequests::test_redirect_with_wrong_gzipped_header",
         "TestRequests::test_unconsumed_session_response_closes_connection",
         "TestRequests::test_response_iter_lines_reentrant",
         "TestRequests::test_session_close_proxy_clear",
-        "TestRequests::test_response_json_when_content_is_None",
-        "TestRequests::test_response_without_release_conn",
-        "test_requests_are_updated_each_time",
-        "test_prepared_copy",
+        # (2 PreparedRequest copy + redirect tests unskipped in #43)
         "test_urllib3_pool_connection_closed",
         "test_json_decode_errors_are_serializable_deserializable",
         "TestPreparingURLs::test_different_connection_pool_for_tls_settings_verify_True",
@@ -115,14 +99,10 @@ _GROUP_B_TESTS = frozenset(
         # test_help.py — currently none (unskipped in #44)
         # test_adapters.py
         "test_request_url_trims_leading_path_separators",
-        # test_requests.py -- require CWD=submodule root for cert/file paths
-        "TestRequests::test_POSTBIN_GET_POST_FILES",
-        "TestRequests::test_POSTBIN_GET_POST_FILES_WITH_DATA",
-        "TestRequests::test_conflicting_post_params",
+        # (3 ENV file-path tests unskipped in #47)
         # mTLS test — requires urllib3 connection pool internals
         "TestPreparingURLs::test_different_connection_pool_for_mtls_settings",
-        # Windows CI: localhost:1 times out instead of connection refused
-        "TestRequests::test_errors",
+        # (test_errors unskipped in #46)
         # test_testserver.py -- all tests
         "TestTestServer::test_basic",
         "TestTestServer::test_server_closes",
@@ -140,6 +120,37 @@ _GROUP_B_TESTS = frozenset(
 
 _GROUP_B_SKIP = pytest.mark.skip(reason="Group B: tests Python internals")
 
+# ---------------------------------------------------------------------------
+# Tests that use relative file paths expecting CWD = submodule root.
+# A fixture temporarily changes CWD to python-requests/ for these tests.
+# ---------------------------------------------------------------------------
+_SUBMODULE_CWD_TESTS = frozenset(
+    {
+        "TestRequests::test_POSTBIN_GET_POST_FILES",
+        "TestRequests::test_POSTBIN_GET_POST_FILES_WITH_DATA",
+        "TestRequests::test_conflicting_post_params",
+    }
+)
+
+_SUBMODULE_ROOT = str(Path(__file__).parent / "python-requests")
+
+
+@pytest.fixture(autouse=True)
+def _submodule_cwd(request):
+    """Temporarily change CWD to the submodule root for tests that open
+    relative file paths (e.g. ``open("requirements-dev.txt")``).
+    """
+    parts = request.node.nodeid.split("::", 1)
+    suffix = parts[1] if len(parts) > 1 else ""
+    base_name = suffix.split("[")[0] if "[" in suffix else suffix
+    if base_name in _SUBMODULE_CWD_TESTS or suffix in _SUBMODULE_CWD_TESTS:
+        old_cwd = os.getcwd()
+        os.chdir(_SUBMODULE_ROOT)
+        yield
+        os.chdir(old_cwd)
+    else:
+        yield
+
 
 def pytest_collection_modifyitems(config, items):
     for item in items:
@@ -151,3 +162,10 @@ def pytest_collection_modifyitems(config, items):
         base_name = suffix.split("[")[0] if "[" in suffix else suffix
         if base_name in _GROUP_B_TESTS or suffix in _GROUP_B_TESTS:
             item.add_marker(_GROUP_B_SKIP)
+        # Windows: localhost:1 gives connect timeout instead of connection refused,
+        # causing ReadTimeout instead of ConnectionError (#46)
+        if (
+            sys.platform == "win32"
+            and "test_errors[http://localhost:1-ConnectionError]" in item.nodeid
+        ):
+            item.add_marker(pytest.mark.skip(reason="Windows: localhost:1 times out"))
