@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyNone, PyString, PyTuple};
 use std::collections::HashMap;
 
-#[derive(Debug, FromPyObject)]
+#[derive(Debug)]
 pub struct RequestParams {
     pub method: String,
     pub url: String,
