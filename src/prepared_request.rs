@@ -1025,22 +1025,25 @@ impl PreparedRequest {
             )
         })?;
 
-        // Create a SimpleNamespace with the fields get_cookie_header needs
-        let types_mod = py.import("types")?;
-        let ns_cls = types_mod.getattr("SimpleNamespace")?;
-        let ns = PyDict::new(py);
-        ns.set_item("url", &self.url)?;
-        ns.set_item(
-            "headers",
-            self.headers_inner.as_ref().map_or_else(
-                || py.None().into_bound(py),
-                |h| h.bind(py).clone().into_any(),
-            ),
+        // Create a PreparedRequest snapshot (same pattern as prepare_auth_impl)
+        let self_snapshot = Py::new(
+            py,
+            PreparedRequest {
+                method: self.method.clone(),
+                url: self.url.clone(),
+                headers_inner: self.headers_inner.as_ref().map(|h| h.clone_ref(py)),
+                body: self.body.as_ref().map(|b| b.clone_ref(py)),
+                hooks_inner: self.hooks_inner.clone_ref(py),
+                cookies_inner: self.cookies_inner.as_ref().map(|c| c.clone_ref(py)),
+                body_position_inner: self
+                    .body_position_inner
+                    .as_ref()
+                    .map(|p| p.clone_ref(py)),
+            },
         )?;
-        ns.set_item("_cookies", cookies_ref.bind(py))?;
-        let request_obj = ns_cls.call((), Some(&ns))?;
 
-        let cookie_header = get_cookie_header.call1((cookies_ref.bind(py), &request_obj))?;
+        let cookie_header =
+            get_cookie_header.call1((cookies_ref.bind(py), &self_snapshot))?;
 
         if !cookie_header.is_none() {
             if let Some(ref headers) = self.headers_inner {
