@@ -381,6 +381,22 @@ fn latin1_to_utf8(input: &str) -> String {
 #[pymethods]
 #[allow(non_snake_case)]
 impl Response {
+    #[classattr]
+    fn __attrs__() -> Vec<&'static str> {
+        vec![
+            "_content",
+            "status_code",
+            "headers",
+            "url",
+            "history",
+            "encoding",
+            "reason",
+            "cookies",
+            "elapsed",
+            "request",
+        ]
+    }
+
     #[new]
     fn py_new(py: Python<'_>) -> PyResult<Self> {
         let cid = Py::new(py, CaseInsensitiveDict::new_empty())?;
