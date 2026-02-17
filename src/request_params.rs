@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyNone, PyString, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyList, PyNone, PyString, PyTuple};
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -59,7 +59,7 @@ impl RequestParams {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataParameter {
-    Form(HashMap<String, String>),
+    Form(Vec<(String, String)>),
     Raw(Vec<u8>),
 }
 
@@ -68,8 +68,19 @@ impl<'a, 'py> FromPyObject<'a, 'py> for DataParameter {
 
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         if let Ok(dict) = ob.cast::<PyDict>() {
-            let map: HashMap<String, String> = dict.extract()?;
-            return Ok(DataParameter::Form(map));
+            let pairs: Vec<(String, String)> = dict
+                .iter()
+                .map(|(k, v)| Ok((k.extract::<String>()?, v.extract::<String>()?)))
+                .collect::<PyResult<_>>()?;
+            return Ok(DataParameter::Form(pairs));
+        }
+
+        if let Ok(list) = ob.cast::<PyList>() {
+            let pairs: Vec<(String, String)> = list
+                .iter()
+                .map(|item| item.extract::<(String, String)>())
+                .collect::<PyResult<_>>()?;
+            return Ok(DataParameter::Form(pairs));
         }
 
         if let Ok(s) = ob.cast::<PyString>() {
