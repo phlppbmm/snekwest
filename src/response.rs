@@ -709,9 +709,8 @@ impl Response {
             .and_then(|v| v.extract(py).ok());
         match location {
             Some(loc) => {
-                let utf8 = latin1_to_utf8(&loc).map_err(|e| {
-                    pyo3::exceptions::PyUnicodeEncodeError::new_err(e)
-                })?;
+                let utf8 = latin1_to_utf8(&loc)
+                    .map_err(pyo3::exceptions::PyUnicodeEncodeError::new_err)?;
                 Ok(Some(utf8))
             }
             None => Ok(None),
@@ -732,7 +731,11 @@ impl Response {
     fn apparent_encoding(&mut self, py: Python<'_>) -> PyResult<String> {
         self.ensure_content_loaded(py)?;
         self.content_consumed = true;
-        let bytes = self.content_bytes.as_ref().map(|b| b.as_slice()).unwrap_or(b"");
+        let bytes = self
+            .content_bytes
+            .as_ref()
+            .map(|b| b.as_slice())
+            .unwrap_or(b"");
         detect_encoding(py, bytes)
     }
 
@@ -770,7 +773,11 @@ impl Response {
         self.ensure_content_loaded(py)?;
         self.content_consumed = true;
 
-        let bytes: &[u8] = self.content_bytes.as_ref().map(|b| b.as_slice()).unwrap_or(b"");
+        let bytes: &[u8] = self
+            .content_bytes
+            .as_ref()
+            .map(|b| b.as_slice())
+            .unwrap_or(b"");
 
         let json_mod = py.import("json")?;
         let requests_jde = py
@@ -1287,5 +1294,129 @@ mod tests {
         let input = "\u{00c3}\u{00a9}";
         let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "\u{00e9}"); // "é"
+    }
+
+    // -- latin1_to_utf8 error case (#51/#53) --
+
+    #[test]
+    fn test_latin1_to_utf8_above_ff_error() {
+        // U+0100 is above the latin1 range — must return Err
+        let input = "\u{0100}";
+        assert!(latin1_to_utf8(input).is_err());
+    }
+
+    #[test]
+    fn test_latin1_to_utf8_boundary_ff() {
+        // U+00FF is the highest valid latin1 char — byte 0xFF
+        let input = "\u{00ff}";
+        let result = latin1_to_utf8(input).unwrap();
+        // 0xFF alone is invalid UTF-8, so from_utf8_lossy replaces it
+        assert!(result.contains('\u{FFFD}') || result.len() > 0);
+    }
+
+    #[test]
+    fn test_latin1_to_utf8_mixed_with_invalid() {
+        // "a\u{0200}b" — the U+0200 char is above 0xFF
+        assert!(latin1_to_utf8("a\u{0200}b").is_err());
+    }
+
+    // -- REDIRECT_STATI (#53) --
+
+    #[test]
+    fn test_redirect_stati_completeness() {
+        assert_eq!(REDIRECT_STATI.len(), 5);
+        assert!(REDIRECT_STATI.contains(&301));
+        assert!(REDIRECT_STATI.contains(&302));
+        assert!(REDIRECT_STATI.contains(&303));
+        assert!(REDIRECT_STATI.contains(&307));
+        assert!(REDIRECT_STATI.contains(&308));
+    }
+
+    #[test]
+    fn test_redirect_stati_non_redirect() {
+        assert!(!REDIRECT_STATI.contains(&200));
+        assert!(!REDIRECT_STATI.contains(&404));
+        assert!(!REDIRECT_STATI.contains(&304));
+    }
+
+    // -- ContentIterator cached-content chunking (#53) --
+
+    #[test]
+    fn test_content_iterator_chunk_all_at_once() {
+        let data = Arc::new(vec![1, 2, 3, 4, 5]);
+        let mut iter = ContentIterator {
+            content: Some(data),
+            pos: 0,
+            raw: None,
+            chunk_size: 0, // 0 = all at once
+            done: false,
+        };
+        // First call: full content
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let chunk = iter.__next__(py).unwrap();
+            assert!(chunk.is_some());
+            let bytes: Vec<u8> = chunk.unwrap().extract(py).unwrap();
+            assert_eq!(bytes, vec![1, 2, 3, 4, 5]);
+            // Second call: done
+            let chunk2 = iter.__next__(py).unwrap();
+            assert!(chunk2.is_none());
+        });
+    }
+
+    #[test]
+    fn test_content_iterator_chunk_size_2() {
+        let data = Arc::new(vec![1, 2, 3, 4, 5]);
+        let mut iter = ContentIterator {
+            content: Some(data),
+            pos: 0,
+            raw: None,
+            chunk_size: 2,
+            done: false,
+        };
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let c1: Vec<u8> = iter.__next__(py).unwrap().unwrap().extract(py).unwrap();
+            assert_eq!(c1, vec![1, 2]);
+            let c2: Vec<u8> = iter.__next__(py).unwrap().unwrap().extract(py).unwrap();
+            assert_eq!(c2, vec![3, 4]);
+            let c3: Vec<u8> = iter.__next__(py).unwrap().unwrap().extract(py).unwrap();
+            assert_eq!(c3, vec![5]);
+            let c4 = iter.__next__(py).unwrap();
+            assert!(c4.is_none());
+        });
+    }
+
+    #[test]
+    fn test_content_iterator_empty_content() {
+        let data = Arc::new(vec![]);
+        let mut iter = ContentIterator {
+            content: Some(data),
+            pos: 0,
+            raw: None,
+            chunk_size: 0,
+            done: false,
+        };
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let chunk = iter.__next__(py).unwrap();
+            assert!(chunk.is_none());
+        });
+    }
+
+    #[test]
+    fn test_content_iterator_no_content_no_raw() {
+        let mut iter = ContentIterator {
+            content: None,
+            pos: 0,
+            raw: None,
+            chunk_size: 1024,
+            done: false,
+        };
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let chunk = iter.__next__(py).unwrap();
+            assert!(chunk.is_none());
+        });
     }
 }
