@@ -846,7 +846,7 @@ impl PreparedRequest {
 
         if !body.is_none() {
             let super_len = py.import("snekwest.utils")?.getattr("super_len")?;
-            let length: u64 = super_len.call1((body,))?.extract().unwrap_or(0);
+            let length: u64 = super_len.call1((body,))?.extract()?;
             if length > 0 {
                 let len_str = PyString::new(py, &length.to_string());
                 headers
