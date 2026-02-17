@@ -257,14 +257,23 @@ pub fn is_valid_cidr(string_network: &str) -> bool {
     }
 }
 
-#[pyfunction]
-pub fn dotted_netmask(mask: u32) -> String {
+/// Inner function: compute dotted netmask from prefix length.
+/// Returns `Err(msg)` for mask > 32, `Ok(ip_string)` otherwise.
+fn dotted_netmask_inner(mask: u32) -> Result<String, String> {
+    if mask > 32 {
+        return Err(format!("mask must be 0-32, got {mask}"));
+    }
     let bits: u32 = if mask == 0 {
         0
     } else {
         !((1u32 << (32 - mask)) - 1)
     };
-    Ipv4Addr::from(bits).to_string()
+    Ok(Ipv4Addr::from(bits).to_string())
+}
+
+#[pyfunction]
+pub fn dotted_netmask(mask: u32) -> PyResult<String> {
+    dotted_netmask_inner(mask).map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
 }
 
 #[pyfunction]
@@ -378,14 +387,21 @@ pub fn requote_uri(py: Python<'_>, uri: &str) -> PyResult<String> {
 }
 
 /// Percent-encode a string, leaving characters in `safe` unencoded.
+///
+/// Iterates over characters (not bytes) so multi-byte UTF-8 characters
+/// are checked against the safe set as whole characters. Non-safe characters
+/// have each byte of their UTF-8 encoding individually percent-encoded.
 fn quote_str(s: &str, safe: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        let c = byte as char;
+    for c in s.chars() {
         if c.is_ascii_alphanumeric() || safe.contains(c) || UNRESERVED_SET.contains(c) {
             result.push(c);
         } else {
-            result.push_str(&format!("%{:02X}", byte));
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            for &byte in encoded.as_bytes() {
+                result.push_str(&format!("%{:02X}", byte));
+            }
         }
     }
     result
@@ -405,15 +421,105 @@ pub fn urldefragauth(url_str: &str) -> String {
     }
 }
 
+/// Check whether a URL string starts with a valid scheme per RFC 3986.
+///
+/// Mirrors urllib3's `_SCHEME_RE = ^(?:[a-zA-Z][a-zA-Z0-9+-]*:|/)`.
+/// Returns `true` when the string either:
+///   - begins with a valid scheme (letter, then `[a-zA-Z0-9+-]*`, then `:`)
+///   - begins with `/` (absolute path / authority)
+fn has_scheme_or_authority(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    // Starts with '/' → authority or absolute path
+    if bytes[0] == b'/' {
+        return true;
+    }
+    // Check for scheme: ^[a-zA-Z][a-zA-Z0-9+-]*:
+    if !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    for &b in &bytes[1..] {
+        if b == b':' {
+            return true; // found the colon that ends the scheme
+        }
+        if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'-') {
+            return false; // invalid scheme character (e.g. '.')
+        }
+    }
+    false
+}
+
 #[pyfunction]
 pub fn prepend_scheme_if_needed(url_str: &str, new_scheme: &str) -> String {
-    // If URL already has a scheme, return as-is
-    if url::Url::parse(url_str).is_ok() {
-        return url_str.to_string();
+    if url_str.is_empty() {
+        return format!("{}://", new_scheme);
     }
-    // Try prepending the scheme
-    let with_scheme = format!("{}://{}", new_scheme, url_str);
-    with_scheme
+
+    // Replicate urllib3's parse_url scheme detection.
+    //
+    // urllib3 uses `_SCHEME_RE = ^(?:[a-zA-Z][a-zA-Z0-9+-]*:|/)` to decide
+    // whether the URL already carries a scheme.  If it does NOT match, urllib3
+    // prepends "//" to force authority-based parsing, which makes scheme=None
+    // so that `prepend_scheme_if_needed` will set it to `new_scheme`.
+    //
+    // When _SCHEME_RE *does* match, the URL either:
+    //   (a) starts with '/' (path / protocol-relative) → scheme=None
+    //   (b) starts with a valid scheme name followed by ':' → scheme is set
+
+    let has_scheme = has_scheme_or_authority(url_str);
+
+    if !has_scheme {
+        // No scheme detected (e.g. "example.com:8080") — prepend new_scheme://
+        return format!("{}://{}", new_scheme, url_str);
+    }
+
+    // Protocol-relative URLs: //host...
+    // urllib3 parse_url: scheme=None, netloc=host → upstream sets scheme.
+    if url_str.starts_with("//") {
+        let stripped = url_str.trim_start_matches('/');
+        return format!("{}://{}", new_scheme, stripped);
+    }
+
+    // Starts with '/' but not '//' (absolute path) → scheme=None in urllib3.
+    if url_str.starts_with('/') {
+        return format!("{}://{}", new_scheme, url_str.trim_start_matches('/'));
+    }
+
+    // _SCHEME_RE matched a real scheme (e.g. "http:", "ftp:", "localhost:").
+    // Upstream leaves the scheme as-is and reconstructs via urlunparse.
+    //
+    // For well-formed URLs like "http://example.com" the reconstruction is
+    // essentially a no-op.  For edge cases like "localhost:3000", urllib3's
+    // parse_url returns (scheme="localhost", netloc=None, path="/3000").
+    // The netloc/path swap then makes netloc="/3000", path=None→"",
+    // so urlunparse produces "localhost:///3000".
+    //
+    // Replicate: parse with url::Url.  When there IS an authority (host),
+    // return the original string (avoid url::Url trailing-slash normalization).
+    // When there is NO authority, replicate the netloc/path swap.
+    if let Ok(parsed) = url::Url::parse(url_str) {
+        if parsed.host().is_some() {
+            // Normal URL with authority — return original to avoid normalization artifacts
+            return url_str.to_string();
+        }
+        // No authority: replicate upstream's netloc/path swap.
+        // urllib3: netloc=None → netloc, path = path, netloc → netloc=path, path=""
+        // urlunparse((scheme, old_path_as_netloc, "", "", query, fragment))
+        // url::Url may strip the leading '/' from opaque paths, so ensure it.
+        let scheme = parsed.scheme();
+        let path = parsed.path();
+        let netloc = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{}", path)
+        };
+        return format!("{}://{}", scheme, netloc);
+    }
+
+    // url::Url couldn't parse — return original
+    url_str.to_string()
 }
 
 #[pyfunction]
@@ -462,6 +568,8 @@ pub fn parse_header_links(value: &str) -> Vec<HashMap<String, String>> {
                     key.trim_matches(replace_chars).to_string(),
                     value.trim_matches(replace_chars).to_string(),
                 );
+            } else {
+                break;
             }
         }
 
@@ -851,6 +959,16 @@ pub fn unquote_header_value(value: &str, is_filename: bool) -> String {
 // 2g: Header validation (check_header_validity)
 // ============================================================================
 
+/// Check if a byte is whitespace per Python's `\s` regex pattern.
+///
+/// Python's `\s` matches all ASCII whitespace including vertical tab (0x0B).
+/// Rust's `is_ascii_whitespace()` covers SPACE (0x20), TAB (0x09), LF (0x0A),
+/// FF (0x0C), CR (0x0D) but omits VT (0x0B). This helper bridges the gap.
+#[inline]
+fn is_python_ascii_whitespace(b: u8) -> bool {
+    b.is_ascii_whitespace() || b == 0x0B
+}
+
 /// Validate a header name (str).
 /// Pattern: `^[^:\s][^:\r\n]*$`
 fn is_valid_header_name_str(name: &str) -> bool {
@@ -859,8 +977,8 @@ fn is_valid_header_name_str(name: &str) -> bool {
     }
     let bytes = name.as_bytes();
     let first = bytes[0];
-    // First char must not be ':' or whitespace
-    if first == b':' || first.is_ascii_whitespace() {
+    // First char must not be ':' or whitespace (including VT per Python \s)
+    if first == b':' || is_python_ascii_whitespace(first) {
         return false;
     }
     // Rest must not contain ':', '\r', '\n'
@@ -879,7 +997,7 @@ fn is_valid_header_name_bytes(name: &[u8]) -> bool {
         return false;
     }
     let first = name[0];
-    if first == b':' || first.is_ascii_whitespace() {
+    if first == b':' || is_python_ascii_whitespace(first) {
         return false;
     }
     for &b in &name[1..] {
@@ -897,8 +1015,8 @@ fn is_valid_header_value_str(value: &str) -> bool {
         return true;
     }
     let bytes = value.as_bytes();
-    // First char must not be whitespace
-    if bytes[0].is_ascii_whitespace() {
+    // First char must not be whitespace (including VT per Python \S)
+    if is_python_ascii_whitespace(bytes[0]) {
         return false;
     }
     // Rest must not contain '\r' or '\n'
@@ -916,7 +1034,7 @@ fn is_valid_header_value_bytes(value: &[u8]) -> bool {
     if value.is_empty() {
         return true;
     }
-    if value[0].is_ascii_whitespace() {
+    if is_python_ascii_whitespace(value[0]) {
         return false;
     }
     for &b in &value[1..] {
@@ -1217,11 +1335,39 @@ mod tests {
     }
 
     #[test]
-    fn test_dotted_netmask() {
-        assert_eq!(dotted_netmask(24), "255.255.255.0");
-        assert_eq!(dotted_netmask(8), "255.0.0.0");
-        assert_eq!(dotted_netmask(16), "255.255.0.0");
-        assert_eq!(dotted_netmask(32), "255.255.255.255");
+    fn test_dotted_netmask_inner_valid() {
+        assert_eq!(dotted_netmask_inner(0).unwrap(), "0.0.0.0");
+        assert_eq!(dotted_netmask_inner(8).unwrap(), "255.0.0.0");
+        assert_eq!(dotted_netmask_inner(16).unwrap(), "255.255.0.0");
+        assert_eq!(dotted_netmask_inner(24).unwrap(), "255.255.255.0");
+        assert_eq!(dotted_netmask_inner(32).unwrap(), "255.255.255.255");
+    }
+
+    #[test]
+    fn test_dotted_netmask_inner_boundary_zero() {
+        // mask=0 should return "0.0.0.0"
+        assert_eq!(dotted_netmask_inner(0).unwrap(), "0.0.0.0");
+    }
+
+    #[test]
+    fn test_dotted_netmask_inner_boundary_32() {
+        // mask=32 should return "255.255.255.255"
+        assert_eq!(dotted_netmask_inner(32).unwrap(), "255.255.255.255");
+    }
+
+    #[test]
+    fn test_dotted_netmask_inner_rejects_33() {
+        // mask=33 must return Err, not panic
+        let result = dotted_netmask_inner(33);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("0-32"));
+    }
+
+    #[test]
+    fn test_dotted_netmask_inner_rejects_large_values() {
+        // mask=64 and u32::MAX must return Err, not panic
+        assert!(dotted_netmask_inner(64).is_err());
+        assert!(dotted_netmask_inner(u32::MAX).is_err());
     }
 
     #[test]
@@ -1282,6 +1428,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_prepend_scheme_if_needed_port_without_scheme() {
+        // Critical case: url::Url::parse("example.com:8080") succeeds with scheme="example.com"
+        // but upstream Python correctly detects this as schemeless
+        assert_eq!(
+            prepend_scheme_if_needed("example.com:8080", "http"),
+            "http://example.com:8080"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_port_with_path() {
+        assert_eq!(
+            prepend_scheme_if_needed("example.com:8080/path", "http"),
+            "http://example.com:8080/path"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_protocol_relative() {
+        // Protocol-relative URL: //example.com should get scheme prepended
+        assert_eq!(
+            prepend_scheme_if_needed("//example.com", "http"),
+            "http://example.com"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_already_has_https() {
+        assert_eq!(
+            prepend_scheme_if_needed("https://secure.example.com/path", "http"),
+            "https://secure.example.com/path"
+        );
+    }
+
+    #[test]
+    fn test_prepend_scheme_if_needed_with_auth() {
+        // Upstream parse_url treats "user" as scheme here, so scheme is NOT None
+        // and the result is the quirky "user:///pass@example.com"
+        assert_eq!(
+            prepend_scheme_if_needed("user:pass@example.com", "http"),
+            "user:///pass@example.com"
+        );
+    }
+
     // -- Header function tests --
 
     #[test]
@@ -1294,6 +1485,33 @@ mod tests {
         assert_eq!(links[0].get("rel").unwrap(), "next");
         assert_eq!(links[1].get("url").unwrap(), "http://example.com/prev");
         assert_eq!(links[1].get("rel").unwrap(), "prev");
+    }
+
+    #[test]
+    fn test_parse_header_links_breaks_on_malformed_param() {
+        // Upstream Python breaks out of param loop when a param has no '='.
+        // "<url>; rel=next; badparam; type=text" should stop at "badparam"
+        // and NOT include "type=text" in the result.
+        let links = parse_header_links(r#"<http://example.com>; rel=next; badparam; type=text"#);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].get("url").unwrap(), "http://example.com");
+        assert_eq!(links[0].get("rel").unwrap(), "next");
+        // "type" must NOT be present — parsing should have stopped at "badparam"
+        assert!(
+            links[0].get("type").is_none(),
+            "Expected 'type' to be absent because parsing should break at 'badparam', but got: {:?}",
+            links[0].get("type")
+        );
+    }
+
+    #[test]
+    fn test_parse_header_links_valid_params_still_work() {
+        // Normal params (all containing '=') should still be fully parsed.
+        let links = parse_header_links(r#"<http://example.com>; rel=next; type=text"#);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].get("url").unwrap(), "http://example.com");
+        assert_eq!(links[0].get("rel").unwrap(), "next");
+        assert_eq!(links[0].get("type").unwrap(), "text");
     }
 
     #[test]
@@ -1489,6 +1707,44 @@ mod tests {
         assert!(!is_valid_header_value_bytes(b"bad\nvalue"));
     }
 
+    // -- Vertical tab (0x0B) rejection tests (Issue #74) --
+    // Python's \s includes VT (0x0B) but Rust's is_ascii_whitespace() does not.
+    // These tests ensure our header validation matches Python's behavior.
+
+    #[test]
+    fn test_header_name_str_rejects_vertical_tab() {
+        // Python regex ^[^\s:][^:\r\n]*$ rejects \x0B as leading char
+        assert!(
+            !is_valid_header_name_str("\x0Bbad"),
+            "Header name starting with VT (0x0B) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_header_name_bytes_rejects_vertical_tab() {
+        assert!(
+            !is_valid_header_name_bytes(b"\x0Bbad"),
+            "Header name bytes starting with VT (0x0B) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_header_value_str_rejects_vertical_tab() {
+        // Python regex ^\S[^\r\n]*$|^$ rejects \x0B as leading char
+        assert!(
+            !is_valid_header_value_str("\x0Bbad"),
+            "Header value starting with VT (0x0B) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_header_value_bytes_rejects_vertical_tab() {
+        assert!(
+            !is_valid_header_value_bytes(b"\x0Bbad"),
+            "Header value bytes starting with VT (0x0B) must be rejected"
+        );
+    }
+
     // -- HTTP list/dict header parsing tests --
 
     #[test]
@@ -1625,6 +1881,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_request_url_leading_triple_slash() {
+        // Upstream: f"/{url.lstrip('/')}" strips ALL leading slashes.
+        // "///path" → "/" + "path" = "/path"
+        assert_eq!(
+            request_url("http://example.com///path", "///path", None),
+            "/path"
+        );
+    }
+
+    #[test]
+    fn test_request_url_leading_quad_slash() {
+        // "////path" → "/" + "path" = "/path"
+        assert_eq!(
+            request_url("http://example.com////path", "////path", None),
+            "/path"
+        );
+    }
+
+    #[test]
+    fn test_request_url_only_double_slash() {
+        // "//" → "/" + "" = "/"
+        assert_eq!(request_url("http://example.com//", "//", None), "/");
+    }
+
     // -- should_bypass_proxies_core tests --
 
     #[test]
@@ -1697,6 +1978,81 @@ mod tests {
             false,
             " example.com , other.com "
         ));
+    }
+
+    // -- quote_str tests (Issue #72) --
+
+    #[test]
+    fn test_quote_str_ascii_unchanged() {
+        // Pure ASCII alphanumeric input should pass through unchanged
+        assert_eq!(quote_str("hello", ""), "hello");
+        assert_eq!(quote_str("Hello123", ""), "Hello123");
+    }
+
+    #[test]
+    fn test_quote_str_ascii_special_encoded() {
+        // ASCII special characters not in safe/unreserved should be percent-encoded
+        assert_eq!(quote_str(" ", ""), "%20");
+        assert_eq!(quote_str("a b", ""), "a%20b");
+    }
+
+    #[test]
+    fn test_quote_str_safe_set_ascii() {
+        // Characters in the safe set should not be encoded
+        assert_eq!(quote_str("a/b", "/"), "a/b");
+        assert_eq!(quote_str("a b", " "), "a b");
+    }
+
+    #[test]
+    fn test_quote_str_multibyte_utf8_encoded() {
+        // Non-ASCII multi-byte UTF-8 characters should have all their bytes
+        // percent-encoded. "café" has é = 0xC3 0xA9.
+        assert_eq!(quote_str("café", ""), "caf%C3%A9");
+    }
+
+    #[test]
+    fn test_quote_str_multibyte_utf8_safe_set_char_match() {
+        // When the safe set contains the decoded character 'é', the entire
+        // character should be passed through un-encoded (not just individual bytes).
+        assert_eq!(quote_str("café", "é"), "café");
+    }
+
+    #[test]
+    fn test_quote_str_multibyte_utf8_safe_set_no_false_match() {
+        // The safe set "x" does NOT contain 'é', so 'é' must be fully encoded.
+        // This is the bug scenario: byte-level iteration could match individual
+        // bytes against the safe set's byte representations.
+        assert_eq!(quote_str("café", "x"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn test_quote_str_cjk_characters() {
+        // CJK characters are 3 bytes each in UTF-8. '日' = E6 97 A5
+        assert_eq!(quote_str("日", ""), "%E6%97%A5");
+    }
+
+    #[test]
+    fn test_quote_str_cjk_in_safe_set() {
+        // When CJK character is in the safe set, it should pass through
+        assert_eq!(quote_str("日", "日"), "日");
+    }
+
+    #[test]
+    fn test_quote_str_emoji_4byte_utf8() {
+        // Emoji '😀' = F0 9F 98 80 (4 bytes in UTF-8)
+        assert_eq!(quote_str("😀", ""), "%F0%9F%98%80");
+    }
+
+    #[test]
+    fn test_quote_str_mixed_ascii_and_multibyte() {
+        // Mix of ASCII and multi-byte: encode non-ASCII, leave ASCII alphanumeric
+        assert_eq!(quote_str("aéb", ""), "a%C3%A9b");
+    }
+
+    #[test]
+    fn test_quote_str_unreserved_set_passthrough() {
+        // Characters in UNRESERVED_SET should pass through
+        assert_eq!(quote_str("-._~", ""), "-._~");
     }
 
     // -- LookupDict / status codes tests --

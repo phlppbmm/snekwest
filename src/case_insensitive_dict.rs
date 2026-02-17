@@ -373,6 +373,27 @@ impl CaseInsensitiveDict {
         }
         Ok(list)
     }
+
+    fn clear(&mut self) {
+        self.store.clear();
+    }
+
+    fn popitem(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self.store.pop() {
+            Some((_lower, (orig_key, val))) => {
+                let tuple = PyTuple::new(
+                    py,
+                    &[orig_key.into_pyobject(py)?.into_any(), val.into_bound(py)],
+                )?;
+                Ok(tuple.into_any().unbind())
+            }
+            None => Err(PyKeyError::new_err("popitem(): dictionary is empty")),
+        }
+    }
+
+    fn __copy__(&self, py: Python<'_>) -> Self {
+        self.copy(py)
+    }
 }
 
 #[pyclass]
@@ -394,6 +415,58 @@ impl CaseInsensitiveDictIter {
             Ok(key)
         } else {
             Err(PyStopIteration::new_err(()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests for CaseInsensitiveDict methods.
+    //
+    // NOTE: CaseInsensitiveDict contains Py<PyAny> in its store, which means
+    // it cannot be instantiated in `cargo test` (the extension-module feature
+    // prevents linking against libpython). The real behavioral tests for
+    // clear(), popitem(), and __copy__() live in Group A (Python test suite).
+    // These Rust tests verify compile-time invariants and structural assertions.
+
+    #[test]
+    fn test_clear_method_exists() {
+        // Compile-time assertion: CaseInsensitiveDict has a clear() method
+        // with the correct signature fn(&mut self). If this test compiles,
+        // the method exists and is callable.
+        // The real behavioral test (clear empties the store) runs in Group A.
+        fn _assert_clear_signature(cid: &mut super::CaseInsensitiveDict) {
+            cid.clear();
+        }
+    }
+
+    // -- popitem() tests (Issue #83) --
+
+    #[test]
+    fn test_popitem_method_exists() {
+        // Compile-time assertion: CaseInsensitiveDict has a popitem() method
+        // with signature fn(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>>.
+        // Returns a tuple of (original_key, value) or raises KeyError if empty.
+        fn _assert_popitem_signature(
+            cid: &mut super::CaseInsensitiveDict,
+            py: pyo3::Python<'_>,
+        ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
+            cid.popitem(py)
+        }
+    }
+
+    // -- __copy__() tests (Issue #84) --
+
+    #[test]
+    fn test_copy_method_exists() {
+        // Compile-time assertion: CaseInsensitiveDict has a __copy__() method
+        // with signature fn(&self, py: Python<'_>) -> Self.
+        // This enables copy.copy() support.
+        fn _assert_copy_signature(
+            cid: &super::CaseInsensitiveDict,
+            py: pyo3::Python<'_>,
+        ) -> super::CaseInsensitiveDict {
+            cid.__copy__(py)
         }
     }
 }

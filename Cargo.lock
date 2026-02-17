@@ -12,6 +12,7 @@ dependencies = [
  "pyo3",
  "pythonize",
  "reqwest",
+ "rustls",
  "serde_json",
  "url",
 ]
