@@ -8,8 +8,6 @@ This module contains the primary objects that power snekwest.
 import datetime  # noqa: F401
 import encodings.idna  # noqa: F401
 from io import BytesIO, UnsupportedOperation  # noqa: F401
-from urllib.parse import urlparse as _urlparse
-
 from ._internal_utils import to_native_string  # noqa: F401
 from .utils import unicode_is_ascii  # noqa: F401
 from .auth import HTTPBasicAuth  # noqa: F401
@@ -75,71 +73,6 @@ REDIRECT_STATI = (
 DEFAULT_REDIRECT_LIMIT = 30
 CONTENT_CHUNK_SIZE = 10 * 1024
 ITER_CHUNK_SIZE = 512
-
-
-def _parse_url(url):
-    """Parse a URL into (scheme, auth, host, port, path, query, fragment).
-    Replacement for urllib3.util.parse_url.
-    """
-    parsed = _urlparse(url)
-    scheme = parsed.scheme or None
-    netloc = parsed.netloc or None
-    path = parsed.path or None
-    query = parsed.query or None
-    fragment = parsed.fragment or None
-
-    # Extract auth from netloc
-    auth = None
-    host = None
-    port = None
-    if netloc:
-        if "@" in netloc:
-            auth, netloc = netloc.rsplit("@", 1)
-        if ":" in netloc and not netloc.startswith("["):
-            host_part, port_str = netloc.rsplit(":", 1)
-            try:
-                port = int(port_str)
-                host = host_part
-            except ValueError:
-                host = netloc
-        elif netloc.startswith("["):
-            # IPv6
-            if "]:" in netloc:
-                host, port_str = netloc.rsplit(":", 1)
-                try:
-                    port = int(port_str)
-                except ValueError:
-                    host = netloc
-            else:
-                host = netloc
-        else:
-            host = netloc
-
-    class ParseResult:
-        def __init__(self, scheme, auth, host, port, path, query, fragment):
-            self.scheme = scheme
-            self.auth = auth
-            self.host = host
-            self.port = port
-            self.path = path
-            self.query = query
-            self.fragment = fragment
-            self.netloc = netloc
-
-        def __iter__(self):
-            return iter(
-                [
-                    self.scheme,
-                    self.auth,
-                    self.host,
-                    self.port,
-                    self.path,
-                    self.query,
-                    self.fragment,
-                ]
-            )
-
-    return ParseResult(scheme, auth, host, port, path, query, fragment)
 
 
 class _FakeOriginalResponse:
