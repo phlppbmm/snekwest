@@ -983,20 +983,8 @@ impl Session {
         validate_url(py, &url)?;
 
         let req_params = RequestParams::from_args(
-            method,
-            url,
-            params,
-            data,
-            json,
-            headers,
-            cookies,
-            files,
-            auth,
-            timeout,
-            proxies,
-            stream,
-            verify,
-            cert,
+            method, url, params, data, json, headers, cookies, files, auth, timeout, proxies,
+            stream, verify, cert,
         );
 
         let raw = self.do_request(req_params)?;

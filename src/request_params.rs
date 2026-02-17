@@ -255,10 +255,7 @@ mod tests {
             let result = DataParameter::extract(list.as_borrowed()).unwrap();
             assert_eq!(
                 result,
-                DataParameter::Form(vec![
-                    ("a".into(), "b".into()),
-                    ("c".into(), "d".into()),
-                ])
+                DataParameter::Form(vec![("a".into(), "b".into()), ("c".into(), "d".into()),])
             );
         });
     }
