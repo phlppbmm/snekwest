@@ -372,9 +372,23 @@ fn detect_encoding(py: Python<'_>, bytes: &[u8]) -> PyResult<String> {
 ///
 /// Each character in `input` is treated as a latin1 byte value (0x00–0xFF).
 /// The collected bytes are then decoded as UTF-8.
-fn latin1_to_utf8(input: &str) -> String {
-    let bytes: Vec<u8> = input.chars().map(|c| c as u32 as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
+/// Returns `Err` if any character is above U+00FF (not representable in latin1).
+fn latin1_to_utf8(input: &str) -> Result<String, String> {
+    let bytes: Vec<u8> = input
+        .chars()
+        .map(|c| {
+            let cp = c as u32;
+            if cp > 0xFF {
+                Err(format!(
+                    "'latin-1' codec can't encode character '\\u{:04x}' in position",
+                    cp
+                ))
+            } else {
+                Ok(cp as u8)
+            }
+        })
+        .collect::<Result<Vec<u8>, String>>()?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -679,21 +693,29 @@ impl Response {
     }
 
     /// Return the redirect target URL with latin1-to-utf8 re-encoding, or None.
-    fn get_redirect_target(&self, py: Python<'_>) -> Option<String> {
+    fn get_redirect_target(&self, py: Python<'_>) -> PyResult<Option<String>> {
         let has_location = match &self.headers_inner {
             Some(h) => h.bind(py).borrow().contains("location"),
             None => false,
         };
         let status = self.status_code.unwrap_or(0);
         if !(has_location && REDIRECT_STATI.contains(&status)) {
-            return None;
+            return Ok(None);
         }
-        let location: String = self
+        let location: Option<String> = self
             .headers_inner
             .as_ref()
             .and_then(|h| h.bind(py).borrow().get_value(py, "location"))
-            .and_then(|v| v.extract(py).ok())?;
-        Some(latin1_to_utf8(&location))
+            .and_then(|v| v.extract(py).ok());
+        match location {
+            Some(loc) => {
+                let utf8 = latin1_to_utf8(&loc).map_err(|e| {
+                    pyo3::exceptions::PyUnicodeEncodeError::new_err(e)
+                })?;
+                Ok(Some(utf8))
+            }
+            None => Ok(None),
+        }
     }
 
     #[getter]
@@ -1202,7 +1224,7 @@ mod tests {
     fn test_latin1_to_utf8_ascii() {
         // Pure ASCII input should pass through unchanged.
         let input = "https://example.com/path?q=hello";
-        let result = latin1_to_utf8(input);
+        let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "https://example.com/path?q=hello");
     }
 
@@ -1246,7 +1268,7 @@ mod tests {
         // For this test, use a URL with a path containing "é" encoded as UTF-8
         // bytes stored in latin1: "/caf\u{00c3}\u{00a9}" → "/café"
         let input = "/caf\u{00c3}\u{00a9}";
-        let result = latin1_to_utf8(input);
+        let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "/caf\u{00e9}"); // "/café" in proper UTF-8
     }
 
@@ -1254,7 +1276,7 @@ mod tests {
     fn test_latin1_to_utf8_empty() {
         // Empty string should produce empty string.
         let input = "";
-        let result = latin1_to_utf8(input);
+        let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "");
     }
 
@@ -1266,7 +1288,7 @@ mod tests {
         // latin1_to_utf8 should extract bytes [0xC3, 0xA9] and decode
         // them as UTF-8 to produce "é" (U+00E9).
         let input = "\u{00c3}\u{00a9}";
-        let result = latin1_to_utf8(input);
+        let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "\u{00e9}"); // "é"
     }
 }
