@@ -73,6 +73,9 @@ from ._bindings import (  # noqa: F401, F811, E402
     parse_list_header,
     parse_dict_header,
     unquote_header_value,
+    default_user_agent,
+    default_headers,
+    DEFAULT_ACCEPT_ENCODING,
 )
 
 NETRC_FILES = (".netrc", "_netrc")
@@ -81,8 +84,7 @@ DEFAULT_CA_BUNDLE_PATH = certs.where()
 
 DEFAULT_PORTS = {"http": 80, "https": 443}
 
-# Inline what urllib3.util.make_headers(accept_encoding=True) returns
-DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br"
+# DEFAULT_ACCEPT_ENCODING is now imported from Rust (_bindings) above.
 
 
 if sys.platform == "win32":
@@ -628,27 +630,7 @@ def resolve_proxies(request, proxies, trust_env=True):
     return new_proxies
 
 
-def default_user_agent(name="python-requests"):
-    """
-    Return a string representing the default user agent.
-
-    :rtype: str
-    """
-    return f"{name}/{__version__}"
-
-
-def default_headers():
-    """
-    :rtype: requests.structures.CaseInsensitiveDict
-    """
-    return CaseInsensitiveDict(
-        {
-            "User-Agent": default_user_agent(),
-            "Accept-Encoding": DEFAULT_ACCEPT_ENCODING,
-            "Accept": "*/*",
-            "Connection": "keep-alive",
-        }
-    )
+# default_user_agent and default_headers are now imported from Rust (_bindings) above.
 
 
 # parse_header_links is now imported from Rust (_bindings) above.

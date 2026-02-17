@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use pyo3::types::PyString;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
@@ -840,6 +841,36 @@ pub fn merge_setting(
         merged.del_item(key)?;
     }
     Ok(merged.unbind())
+}
+
+// ============================================================================
+// 2i: Default headers / user-agent
+// ============================================================================
+
+/// Inline what urllib3.util.make_headers(accept_encoding=True) returns.
+pub const DEFAULT_ACCEPT_ENCODING: &str = "gzip, deflate, br";
+
+/// Return a string representing the default user agent.
+#[pyfunction]
+#[pyo3(signature = (name="python-requests"))]
+pub fn default_user_agent(py: Python<'_>, name: &str) -> PyResult<String> {
+    let version: String = py
+        .import("snekwest.__version__")?
+        .getattr("__version__")?
+        .extract()?;
+    Ok(format!("{name}/{version}"))
+}
+
+/// Return default HTTP headers as a CaseInsensitiveDict.
+#[pyfunction]
+pub fn default_headers(py: Python<'_>) -> PyResult<crate::case_insensitive_dict::CaseInsensitiveDict> {
+    let mut dict = crate::case_insensitive_dict::CaseInsensitiveDict::new_empty();
+    let ua = default_user_agent(py, "python-requests")?;
+    dict.set_item(py, "User-Agent", PyString::new(py, &ua).into_any())?;
+    dict.set_item(py, "Accept-Encoding", PyString::new(py, DEFAULT_ACCEPT_ENCODING).into_any())?;
+    dict.set_item(py, "Accept", PyString::new(py, "*/*").into_any())?;
+    dict.set_item(py, "Connection", PyString::new(py, "keep-alive").into_any())?;
+    Ok(dict)
 }
 
 // ============================================================================
