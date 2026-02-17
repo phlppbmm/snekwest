@@ -794,13 +794,30 @@ impl Response {
         this.raise_for_status_impl(py, Some(slf.as_any().clone().unbind()))
     }
 
-    #[pyo3(signature = (chunk_size=1, decode_unicode=false))]
+    #[pyo3(signature = (chunk_size=None, decode_unicode=false))]
     fn iter_content(
         &mut self,
         py: Python<'_>,
-        chunk_size: Option<usize>,
+        chunk_size: Option<&Bound<'_, PyAny>>,
         decode_unicode: bool,
     ) -> PyResult<Py<PyAny>> {
+        // Validate chunk_size type (matching upstream TypeError message)
+        let cs: Option<usize> = match chunk_size {
+            None => Some(1), // default
+            Some(obj) => {
+                if obj.is_none() {
+                    None
+                } else if let Ok(val) = obj.extract::<usize>() {
+                    Some(val)
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "chunk_size must be an int, it is instead a {}.",
+                        obj.get_type()
+                    )));
+                }
+            }
+        };
+
         // Check StreamConsumedError
         if self.content_consumed && !self.content_loaded {
             let exc = py
@@ -808,8 +825,6 @@ impl Response {
                 .getattr("StreamConsumedError")?;
             return Err(PyErr::from_value(exc.call0()?));
         }
-
-        let cs = chunk_size;
 
         // Build ContentIterator
         let iter = if self.content_consumed {
@@ -859,7 +874,8 @@ impl Response {
         delimiter: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         // Get the content iterator
-        let content_iter = self.iter_content(py, Some(chunk_size), decode_unicode)?;
+        let cs_obj = chunk_size.into_pyobject(py)?;
+        let content_iter = self.iter_content(py, Some(&cs_obj.into_any()), decode_unicode)?;
 
         let iter = LinesIterator {
             content_iter,
@@ -906,7 +922,8 @@ impl Response {
     }
 
     fn __iter__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        self.iter_content(py, Some(128), false)
+        let cs_obj = 128usize.into_pyobject(py)?;
+        self.iter_content(py, Some(&cs_obj.into_any()), false)
     }
 
     fn __repr__(&self) -> String {
