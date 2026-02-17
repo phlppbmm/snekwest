@@ -7,7 +7,7 @@ name = "snekwest"
 version = "0.1.0"
 description = "A blazingly fast, memory-safe HTTP client ecosystem for Python, powered by Rust's reqwest."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "certifi>=2026.1.4",
     "idna>=3.11",
@@ -17,6 +17,11 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 [tool.maturin]
