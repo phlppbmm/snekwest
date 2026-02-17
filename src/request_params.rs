@@ -135,10 +135,13 @@ impl<'a, 'py> FromPyObject<'a, 'py> for TimeoutParameter {
                 return Ok(TimeoutParameter::Pair(connect, read));
             }
 
-            // 3+ element tuple is invalid
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Timeout value connect is invalid. It must be a (connect, read) tuple.",
-            ));
+            // Non-2-element tuple is invalid
+            let repr: String = ob.repr()?.to_string();
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid timeout {}. Pass a (connect, read) timeout tuple, \
+                 or a single float to set both timeouts to the same value.",
+                repr
+            )));
         }
 
         // String or other type
