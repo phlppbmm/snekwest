@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::exceptions::{make_exception, raise_nested_exception};
+use crate::exceptions::{
+    make_exception, make_exception_with_request, raise_nested_exception_with_request,
+};
 use crate::request_params::CertParameter;
 use crate::request_params::{DataParameter, RequestParams, TimeoutParameter, VerifyParameter};
 use crate::response::{RawResponseData, Response, StreamingInner};
@@ -312,35 +314,37 @@ fn map_reqwest_error(
     e: reqwest::Error,
     had_explicit_connect_timeout: bool,
     has_proxies: bool,
+    request: Option<&Py<PyAny>>,
 ) -> PyErr {
     let msg = full_error_chain(&e);
 
     // 1. SSL/TLS errors — check source chain (not URL text)
     if is_ssl_error(&e) {
-        return make_exception(py, "SSLError", msg);
+        return make_exception_with_request(py, "SSLError", msg, request);
     }
 
     // 2. Connection errors that are NOT timeouts (connection refused, reset, etc.)
     if e.is_connect() && !e.is_timeout() {
         let lower = msg.to_lowercase();
         if has_proxies || lower.contains("proxy") || lower.contains("tunnel") {
-            return make_exception(py, "ProxyError", msg);
+            return make_exception_with_request(py, "ProxyError", msg, request);
         }
-        return make_exception(py, "ConnectionError", msg);
+        return make_exception_with_request(py, "ConnectionError", msg, request);
     }
 
     // 3. Timeout errors
     if e.is_timeout() {
         if e.is_connect() {
             if had_explicit_connect_timeout {
-                return raise_nested_exception(
+                return raise_nested_exception_with_request(
                     py,
                     "ConnectTimeout",
                     format!("ConnectTimeout: connection timed out. {}", msg),
+                    request,
                 );
             }
             // Connection attempt timed out under a general/single timeout
-            return make_exception(py, "ConnectionError", msg);
+            return make_exception_with_request(py, "ConnectionError", msg, request);
         }
         // Read / general timeout
         let read_msg = if msg.to_lowercase().contains("timed out") {
@@ -348,32 +352,32 @@ fn map_reqwest_error(
         } else {
             format!("Read timed out. {}", msg)
         };
-        return raise_nested_exception(py, "ReadTimeout", read_msg);
+        return raise_nested_exception_with_request(py, "ReadTimeout", read_msg, request);
     }
 
     // 4. Body/decode errors
     if e.is_decode() {
-        return make_exception(py, "ContentDecodingError", msg);
+        return make_exception_with_request(py, "ContentDecodingError", msg, request);
     }
 
     // 5. Redirect errors
     if e.is_redirect() {
-        return make_exception(py, "TooManyRedirects", msg);
+        return make_exception_with_request(py, "TooManyRedirects", msg, request);
     }
 
     // 6. Builder errors
     if e.is_builder() {
-        return make_exception(py, "InvalidURL", msg);
+        return make_exception_with_request(py, "InvalidURL", msg, request);
     }
 
     // 7. Connection closed / chunked encoding
     let lower = msg.to_lowercase();
     if lower.contains("connection closed") || lower.contains("incompletemessage") {
-        return make_exception(py, "ChunkedEncodingError", msg);
+        return make_exception_with_request(py, "ChunkedEncodingError", msg, request);
     }
 
     // Default
-    make_exception(py, "ConnectionError", msg)
+    make_exception_with_request(py, "ConnectionError", msg, request)
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -812,7 +816,9 @@ impl Session {
         // Release the GIL so Python-based servers (httpbin etc.) can process
         Python::attach(|py| {
             py.detach(|| request.send())
-                .map_err(|e| map_reqwest_error(py, e, had_explicit_connect_timeout, has_proxies))
+                .map_err(|e| {
+                    map_reqwest_error(py, e, had_explicit_connect_timeout, has_proxies, None)
+                })
         })
     }
 
