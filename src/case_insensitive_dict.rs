@@ -373,6 +373,10 @@ impl CaseInsensitiveDict {
         }
         Ok(list)
     }
+
+    fn clear(&mut self) {
+        self.store.clear();
+    }
 }
 
 #[pyclass]
@@ -394,6 +398,28 @@ impl CaseInsensitiveDictIter {
             Ok(key)
         } else {
             Err(PyStopIteration::new_err(()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests for CaseInsensitiveDict methods.
+    //
+    // NOTE: CaseInsensitiveDict contains Py<PyAny> in its store, which means
+    // it cannot be instantiated in `cargo test` (the extension-module feature
+    // prevents linking against libpython). The real behavioral tests for
+    // clear(), popitem(), and __copy__() live in Group A (Python test suite).
+    // These Rust tests verify compile-time invariants and structural assertions.
+
+    #[test]
+    fn test_clear_method_exists() {
+        // Compile-time assertion: CaseInsensitiveDict has a clear() method
+        // with the correct signature fn(&mut self). If this test compiles,
+        // the method exists and is callable.
+        // The real behavioral test (clear empties the store) runs in Group A.
+        fn _assert_clear_signature(cid: &mut super::CaseInsensitiveDict) {
+            cid.clear();
         }
     }
 }
