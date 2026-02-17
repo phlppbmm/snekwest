@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::LazyLock;
 
 // ============================================================================
 // LookupDict — Dictionary lookup object for status codes
@@ -212,14 +213,16 @@ fn build_status_map() -> HashMap<String, i32> {
     map
 }
 
+/// Cached status map — built once, reused across calls.
+static STATUS_MAP: LazyLock<HashMap<String, i32>> = LazyLock::new(build_status_map);
+
 /// Construct a pre-populated `LookupDict` with all HTTP status code mappings.
 #[pyfunction]
 pub fn _init_status_codes() -> PyResult<LookupDict> {
     let mut codes = LookupDict::new(Some("status_codes".to_string()));
-    let status_map = build_status_map();
 
     Python::attach(|py| {
-        for (key, code) in &status_map {
+        for (key, code) in STATUS_MAP.iter() {
             let code_obj: Py<PyAny> = code.into_pyobject(py)?.into_any().unbind();
             codes.data.insert(key.clone(), code_obj);
         }
@@ -2063,7 +2066,7 @@ mod tests {
 
     #[test]
     fn test_build_status_map_keys() {
-        let map = build_status_map();
+        let map = &*STATUS_MAP;
         // Check that data was populated
         assert!(map.contains_key("ok"));
         assert!(map.contains_key("OK"));
@@ -2079,7 +2082,7 @@ mod tests {
 
     #[test]
     fn test_build_status_map_values() {
-        let map = build_status_map();
+        let map = &*STATUS_MAP;
         assert_eq!(map.get("ok"), Some(&200));
         assert_eq!(map.get("OK"), Some(&200));
         assert_eq!(map.get("not_found"), Some(&404));
