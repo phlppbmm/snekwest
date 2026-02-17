@@ -154,7 +154,7 @@ impl PreparedRequest {
                 } else {
                     m.str()?.to_string()
                 };
-                self.method = Some(s.trim().to_uppercase());
+                self.method = Some(s.to_uppercase());
             }
             _ => {
                 self.method = None;
