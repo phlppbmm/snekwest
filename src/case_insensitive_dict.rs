@@ -390,6 +390,10 @@ impl CaseInsensitiveDict {
             None => Err(PyKeyError::new_err("popitem(): dictionary is empty")),
         }
     }
+
+    fn __copy__(&self, py: Python<'_>) -> Self {
+        self.copy(py)
+    }
 }
 
 #[pyclass]
@@ -448,6 +452,21 @@ mod tests {
             py: pyo3::Python<'_>,
         ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
             cid.popitem(py)
+        }
+    }
+
+    // -- __copy__() tests (Issue #84) --
+
+    #[test]
+    fn test_copy_method_exists() {
+        // Compile-time assertion: CaseInsensitiveDict has a __copy__() method
+        // with signature fn(&self, py: Python<'_>) -> Self.
+        // This enables copy.copy() support.
+        fn _assert_copy_signature(
+            cid: &super::CaseInsensitiveDict,
+            py: pyo3::Python<'_>,
+        ) -> super::CaseInsensitiveDict {
+            cid.__copy__(py)
         }
     }
 }
