@@ -103,8 +103,7 @@ _GROUP_B_TESTS = frozenset(
         # (3 ENV file-path tests unskipped in #47)
         # mTLS test — requires urllib3 connection pool internals
         "TestPreparingURLs::test_different_connection_pool_for_mtls_settings",
-        # Windows CI: localhost:1 times out instead of connection refused
-        "TestRequests::test_errors",
+        # (test_errors unskipped in #46)
         # test_testserver.py -- all tests
         "TestTestServer::test_basic",
         "TestTestServer::test_server_closes",
