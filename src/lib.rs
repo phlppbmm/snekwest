@@ -3,7 +3,7 @@ mod exceptions;
 pub mod prepared_request;
 mod request_params;
 mod response;
-mod session;
+pub mod session;
 pub mod utils;
 
 use case_insensitive_dict::{CaseInsensitiveDict, CaseInsensitiveDictIter};
@@ -48,5 +48,9 @@ fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(utils::default_user_agent, m)?)?;
     m.add_function(wrap_pyfunction!(utils::default_headers, m)?)?;
     m.add("DEFAULT_ACCEPT_ENCODING", utils::DEFAULT_ACCEPT_ENCODING)?;
+
+    // Session utility functions
+    m.add_function(wrap_pyfunction!(session::should_strip_auth, m)?)?;
+    m.add_function(wrap_pyfunction!(session::rebuild_method, m)?)?;
     Ok(())
 }

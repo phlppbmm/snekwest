@@ -90,8 +90,8 @@ fn is_redirect_status(status: u16) -> bool {
 
 /// Decide whether the Authorization header should be stripped when redirecting
 /// from `old_url` to `new_url`. Mirrors requests' `should_strip_auth`.
-#[allow(dead_code)]
-fn should_strip_auth(old_url: &str, new_url: &str) -> bool {
+#[pyfunction]
+pub fn should_strip_auth(old_url: &str, new_url: &str) -> bool {
     let old = match url::Url::parse(old_url) {
         Ok(u) => u,
         Err(_) => return false,
@@ -135,6 +135,22 @@ fn should_strip_auth(old_url: &str, new_url: &str) -> bool {
     }
 
     changed_port || changed_scheme
+}
+
+/// Choose the redirect HTTP method based on status code.
+/// Mirrors requests' `SessionRedirectMixin.rebuild_method`.
+#[pyfunction]
+pub fn rebuild_method(method: &str, status_code: u16) -> String {
+    if status_code == 303 && method != "HEAD" {
+        return "GET".to_string();
+    }
+    if status_code == 302 && method != "HEAD" {
+        return "GET".to_string();
+    }
+    if status_code == 301 && method == "POST" {
+        return "GET".to_string();
+    }
+    method.to_string()
 }
 
 /// Validate the URL and raise the appropriate Python exception for invalid URLs.
@@ -1754,5 +1770,54 @@ mod tests {
             "http://example.com:8080/a",
             "https://example.com:8443/b"
         ));
+    }
+
+    // -- rebuild_method tests --
+
+    #[test]
+    fn test_rebuild_method_303_get() {
+        assert_eq!(rebuild_method("POST", 303), "GET");
+        assert_eq!(rebuild_method("PUT", 303), "GET");
+    }
+
+    #[test]
+    fn test_rebuild_method_303_head_passthrough() {
+        assert_eq!(rebuild_method("HEAD", 303), "HEAD");
+    }
+
+    #[test]
+    fn test_rebuild_method_302_get() {
+        assert_eq!(rebuild_method("POST", 302), "GET");
+        assert_eq!(rebuild_method("PUT", 302), "GET");
+    }
+
+    #[test]
+    fn test_rebuild_method_302_head_passthrough() {
+        assert_eq!(rebuild_method("HEAD", 302), "HEAD");
+    }
+
+    #[test]
+    fn test_rebuild_method_301_post_to_get() {
+        assert_eq!(rebuild_method("POST", 301), "GET");
+    }
+
+    #[test]
+    fn test_rebuild_method_301_non_post_passthrough() {
+        assert_eq!(rebuild_method("GET", 301), "GET");
+        assert_eq!(rebuild_method("HEAD", 301), "HEAD");
+        assert_eq!(rebuild_method("PUT", 301), "PUT");
+    }
+
+    #[test]
+    fn test_rebuild_method_307_passthrough() {
+        assert_eq!(rebuild_method("POST", 307), "POST");
+        assert_eq!(rebuild_method("GET", 307), "GET");
+        assert_eq!(rebuild_method("HEAD", 307), "HEAD");
+    }
+
+    #[test]
+    fn test_rebuild_method_308_passthrough() {
+        assert_eq!(rebuild_method("POST", 308), "POST");
+        assert_eq!(rebuild_method("GET", 308), "GET");
     }
 }
