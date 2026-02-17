@@ -36,7 +36,6 @@ exclude = ["python-requests/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "python-requests/tests"]
-confcutdir = "."
 
 [dependency-groups]
 dev = [

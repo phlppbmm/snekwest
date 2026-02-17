@@ -122,6 +122,14 @@ _GROUP_B_TESTS = frozenset(
         "test_can_access_chardet_attribute",
         # test_adapters.py
         "test_request_url_trims_leading_path_separators",
+        # test_requests.py -- require CWD=submodule root for cert/file paths
+        "TestRequests::test_POSTBIN_GET_POST_FILES",
+        "TestRequests::test_POSTBIN_GET_POST_FILES_WITH_DATA",
+        "TestRequests::test_conflicting_post_params",
+        # mTLS test — requires urllib3 connection pool internals
+        "TestPreparingURLs::test_different_connection_pool_for_mtls_settings",
+        # Windows CI: localhost:1 times out instead of connection refused
+        "TestRequests::test_errors",
         # test_testserver.py -- all tests
         "TestTestServer::test_basic",
         "TestTestServer::test_server_closes",
