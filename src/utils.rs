@@ -387,14 +387,21 @@ pub fn requote_uri(py: Python<'_>, uri: &str) -> PyResult<String> {
 }
 
 /// Percent-encode a string, leaving characters in `safe` unencoded.
+///
+/// Iterates over characters (not bytes) so multi-byte UTF-8 characters
+/// are checked against the safe set as whole characters. Non-safe characters
+/// have each byte of their UTF-8 encoding individually percent-encoded.
 fn quote_str(s: &str, safe: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        let c = byte as char;
+    for c in s.chars() {
         if c.is_ascii_alphanumeric() || safe.contains(c) || UNRESERVED_SET.contains(c) {
             result.push(c);
         } else {
-            result.push_str(&format!("%{:02X}", byte));
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            for &byte in encoded.as_bytes() {
+                result.push_str(&format!("%{:02X}", byte));
+            }
         }
     }
     result
@@ -1811,6 +1818,81 @@ mod tests {
             false,
             " example.com , other.com "
         ));
+    }
+
+    // -- quote_str tests (Issue #72) --
+
+    #[test]
+    fn test_quote_str_ascii_unchanged() {
+        // Pure ASCII alphanumeric input should pass through unchanged
+        assert_eq!(quote_str("hello", ""), "hello");
+        assert_eq!(quote_str("Hello123", ""), "Hello123");
+    }
+
+    #[test]
+    fn test_quote_str_ascii_special_encoded() {
+        // ASCII special characters not in safe/unreserved should be percent-encoded
+        assert_eq!(quote_str(" ", ""), "%20");
+        assert_eq!(quote_str("a b", ""), "a%20b");
+    }
+
+    #[test]
+    fn test_quote_str_safe_set_ascii() {
+        // Characters in the safe set should not be encoded
+        assert_eq!(quote_str("a/b", "/"), "a/b");
+        assert_eq!(quote_str("a b", " "), "a b");
+    }
+
+    #[test]
+    fn test_quote_str_multibyte_utf8_encoded() {
+        // Non-ASCII multi-byte UTF-8 characters should have all their bytes
+        // percent-encoded. "café" has é = 0xC3 0xA9.
+        assert_eq!(quote_str("café", ""), "caf%C3%A9");
+    }
+
+    #[test]
+    fn test_quote_str_multibyte_utf8_safe_set_char_match() {
+        // When the safe set contains the decoded character 'é', the entire
+        // character should be passed through un-encoded (not just individual bytes).
+        assert_eq!(quote_str("café", "é"), "café");
+    }
+
+    #[test]
+    fn test_quote_str_multibyte_utf8_safe_set_no_false_match() {
+        // The safe set "x" does NOT contain 'é', so 'é' must be fully encoded.
+        // This is the bug scenario: byte-level iteration could match individual
+        // bytes against the safe set's byte representations.
+        assert_eq!(quote_str("café", "x"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn test_quote_str_cjk_characters() {
+        // CJK characters are 3 bytes each in UTF-8. '日' = E6 97 A5
+        assert_eq!(quote_str("日", ""), "%E6%97%A5");
+    }
+
+    #[test]
+    fn test_quote_str_cjk_in_safe_set() {
+        // When CJK character is in the safe set, it should pass through
+        assert_eq!(quote_str("日", "日"), "日");
+    }
+
+    #[test]
+    fn test_quote_str_emoji_4byte_utf8() {
+        // Emoji '😀' = F0 9F 98 80 (4 bytes in UTF-8)
+        assert_eq!(quote_str("😀", ""), "%F0%9F%98%80");
+    }
+
+    #[test]
+    fn test_quote_str_mixed_ascii_and_multibyte() {
+        // Mix of ASCII and multi-byte: encode non-ASCII, leave ASCII alphanumeric
+        assert_eq!(quote_str("aéb", ""), "a%C3%A9b");
+    }
+
+    #[test]
+    fn test_quote_str_unreserved_set_passthrough() {
+        // Characters in UNRESERVED_SET should pass through
+        assert_eq!(quote_str("-._~", ""), "-._~");
     }
 
     // -- LookupDict / status codes tests --
