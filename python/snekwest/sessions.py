@@ -160,7 +160,10 @@ class SessionRedirectMixin:
                     allow_redirects=False,
                     **adapter_kwargs,
                 )
-                extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
+                if hasattr(self, '_extract_cookies_to_session'):
+                    self._extract_cookies_to_session(prepared_request, resp.raw)
+                else:
+                    extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
                 url = self.get_redirect_target(resp)
                 yield resp
 

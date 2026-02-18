@@ -4,6 +4,68 @@ use pyo3::types::{IntoPyDict, PyBytes, PyDict, PyList, PyString, PyTuple};
 
 use crate::case_insensitive_dict::CaseInsensitiveDict;
 
+/// Check if a cookie (from Python jar) matches a request URL.
+/// Implements domain/path/scheme matching per RFC 6265.
+fn cookie_matches_url(
+    domain: &str,
+    path: &str,
+    secure: bool,
+    expires: Option<i64>,
+    url: &url::Url,
+) -> bool {
+    // Expiry check
+    if let Some(exp) = expires {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if exp < now {
+            return false;
+        }
+    }
+
+    // Scheme check: Secure cookies only over HTTPS
+    if secure && url.scheme() != "https" {
+        return false;
+    }
+
+    // Domain check
+    if !domain.is_empty() {
+        let host = url.host_str().unwrap_or("");
+        let domain_lower = domain.to_lowercase();
+        let host_lower = host.to_lowercase();
+
+        if let Some(suffix) = domain_lower.strip_prefix('.') {
+            // Domain cookie (e.g., ".example.com"): matches host and subdomains
+            if host_lower != suffix && !host_lower.ends_with(&domain_lower) {
+                return false;
+            }
+        } else {
+            // Host-only cookie: must match exactly
+            if host_lower != domain_lower {
+                return false;
+            }
+        }
+    }
+    // Empty domain (supercookie): matches all hosts
+
+    // Path check
+    if !path.is_empty() {
+        let url_path = url.path();
+        if url_path != path && !url_path.starts_with(&format!("{}/", path.trim_end_matches('/'))) {
+            // Path doesn't match unless it's an exact match or a prefix with /
+            if !path.ends_with('/') && url_path != path && !url_path.starts_with(path) {
+                return false;
+            }
+            if path.ends_with('/') && !url_path.starts_with(path) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// Parse a netloc string into (auth, host, port) without normalization.
 /// Handles IPv6 brackets, user:pass@host, and host:port patterns.
 fn parse_netloc(netloc: &str) -> (Option<String>, Option<String>, Option<u16>) {
@@ -1066,39 +1128,49 @@ impl PreparedRequest {
             self.cookies_inner = Some(cookiejar_from_dict.call1((py.None(),))?.unbind());
         }
 
-        // Get cookie header - we need to pass an object with .url and .headers
-        let get_cookie_header = py
-            .import("snekwest.cookies")?
-            .getattr("get_cookie_header")?;
-
+        // Generate Cookie header using Rust-based domain/path/scheme matching
         let cookies_ref = self.cookies_inner.as_ref().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "Cookies not initialized. Call prepare_cookies() first.",
             )
         })?;
 
-        // Create a PreparedRequest snapshot (same pattern as prepare_auth_impl)
-        let self_snapshot = Py::new(
-            py,
-            PreparedRequest {
-                method: self.method.clone(),
-                url: self.url.clone(),
-                headers_inner: self.headers_inner.as_ref().map(|h| h.clone_ref(py)),
-                body: self.body.as_ref().map(|b| b.clone_ref(py)),
-                hooks_inner: self.hooks_inner.clone_ref(py),
-                cookies_inner: self.cookies_inner.as_ref().map(|c| c.clone_ref(py)),
-                body_position_inner: self.body_position_inner.as_ref().map(|p| p.clone_ref(py)),
-            },
-        )?;
+        let parsed_url = self.url.as_ref().and_then(|u| url::Url::parse(u).ok());
 
-        let cookie_header = get_cookie_header.call1((cookies_ref.bind(py), &self_snapshot))?;
+        let jar = cookies_ref.bind(py);
+        let mut cookie_parts: Vec<String> = Vec::new();
 
-        if !cookie_header.is_none() {
+        for cookie_result in jar.try_iter()? {
+            let cookie_obj = cookie_result?;
+            let name: String = cookie_obj.getattr("name")?.extract()?;
+            let value: String = cookie_obj.getattr("value")?.extract()?;
+
+            if let Some(ref url) = parsed_url {
+                let domain: String = cookie_obj.getattr("domain")?.extract().unwrap_or_default();
+                let path: String = cookie_obj
+                    .getattr("path")?
+                    .extract()
+                    .unwrap_or_else(|_| "/".to_string());
+                let secure: bool = cookie_obj.getattr("secure")?.extract().unwrap_or(false);
+                let expires: Option<i64> = cookie_obj.getattr("expires")?.extract().unwrap_or(None);
+
+                if cookie_matches_url(&domain, &path, secure, expires, url) {
+                    cookie_parts.push(format!("{}={}", name, value));
+                }
+            } else {
+                // No valid URL — include all cookies (matches Python behavior)
+                cookie_parts.push(format!("{}={}", name, value));
+            }
+        }
+
+        if !cookie_parts.is_empty() {
+            let cookie_header = cookie_parts.join("; ");
             if let Some(ref headers) = self.headers_inner {
-                headers
-                    .bind(py)
-                    .borrow_mut()
-                    .set_item(py, "Cookie", cookie_header)?;
+                headers.bind(py).borrow_mut().set_item(
+                    py,
+                    "Cookie",
+                    PyString::new(py, &cookie_header).into_any(),
+                )?;
             }
         }
         Ok(())
@@ -1408,5 +1480,92 @@ mod tests {
     #[test]
     fn test_path_url_invalid() {
         assert_eq!(super::path_url_from_str("not-a-url"), "/");
+    }
+
+    // -- cookie_matches_url tests --
+
+    #[test]
+    fn test_cookie_matches_supercookie() {
+        // Empty domain matches everything
+        let url = url::Url::parse("http://example.com/").unwrap();
+        assert!(super::cookie_matches_url("", "/", false, None, &url));
+    }
+
+    #[test]
+    fn test_cookie_matches_exact_domain() {
+        let url = url::Url::parse("http://example.com/").unwrap();
+        assert!(super::cookie_matches_url(
+            "example.com",
+            "/",
+            false,
+            None,
+            &url
+        ));
+        assert!(!super::cookie_matches_url(
+            "other.com",
+            "/",
+            false,
+            None,
+            &url
+        ));
+    }
+
+    #[test]
+    fn test_cookie_matches_domain_suffix() {
+        let url = url::Url::parse("http://sub.example.com/").unwrap();
+        assert!(super::cookie_matches_url(
+            ".example.com",
+            "/",
+            false,
+            None,
+            &url
+        ));
+        assert!(super::cookie_matches_url(
+            ".sub.example.com",
+            "/",
+            false,
+            None,
+            &url
+        ));
+        assert!(!super::cookie_matches_url(
+            ".other.com",
+            "/",
+            false,
+            None,
+            &url
+        ));
+    }
+
+    #[test]
+    fn test_cookie_matches_secure_scheme() {
+        let http = url::Url::parse("http://example.com/").unwrap();
+        let https = url::Url::parse("https://example.com/").unwrap();
+        assert!(!super::cookie_matches_url("", "/", true, None, &http));
+        assert!(super::cookie_matches_url("", "/", true, None, &https));
+    }
+
+    #[test]
+    fn test_cookie_matches_expired() {
+        let url = url::Url::parse("http://example.com/").unwrap();
+        // Expired in the past
+        assert!(!super::cookie_matches_url("", "/", false, Some(0), &url));
+        // Expires far in the future
+        assert!(super::cookie_matches_url(
+            "",
+            "/",
+            false,
+            Some(9999999999),
+            &url
+        ));
+        // No expiry (session cookie)
+        assert!(super::cookie_matches_url("", "/", false, None, &url));
+    }
+
+    #[test]
+    fn test_cookie_matches_path() {
+        let url = url::Url::parse("http://example.com/app/page").unwrap();
+        assert!(super::cookie_matches_url("", "/app", false, None, &url));
+        assert!(super::cookie_matches_url("", "/", false, None, &url));
+        assert!(!super::cookie_matches_url("", "/other", false, None, &url));
     }
 }

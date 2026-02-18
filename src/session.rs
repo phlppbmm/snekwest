@@ -1,9 +1,10 @@
+use cookie_store::{CookieDomain, CookieExpiration, CookieStore};
 use indexmap::IndexMap;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict};
 use pythonize::depythonize;
 use reqwest::blocking::{Client, ClientBuilder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -499,6 +500,10 @@ fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
 pub struct Session {
     // Internal transport state (used by make_request/do_request chain)
     clients: Mutex<IndexMap<ClientConfig, Arc<Client>>>,
+    // Rust cookie store — authoritative for server-set cookies (RFC 6265)
+    rust_cookie_store: Mutex<CookieStore>,
+    // Tracks (name, domain, path) of cookies synced from Rust store → Python jar
+    synced_cookies: Mutex<HashSet<(String, String, String)>>,
     // Python-facing session attributes
     #[pyo3(get, set)]
     pub headers: Py<PyAny>,
@@ -913,6 +918,120 @@ impl Session {
             streaming_headers: streaming_hdrs,
         })
     }
+
+    /// Parse Set-Cookie headers from a response and add to the Rust CookieStore.
+    fn parse_response_set_cookies(&self, request_url: &str, set_cookie_values: &[String]) {
+        let url = match url::Url::parse(request_url) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let mut store = self
+            .rust_cookie_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for raw_cookie in set_cookie_values {
+            let _ = store.parse(raw_cookie, &url);
+        }
+    }
+
+    /// Sync cookies from Rust CookieStore → Python `self.cookies` jar.
+    /// Only adds/updates domain-scoped cookies; leaves user-set supercookies untouched.
+    fn sync_store_to_jar(&self, py: Python<'_>) -> PyResult<()> {
+        let create_cookie = py.import("snekwest.cookies")?.getattr("create_cookie")?;
+        let jar = self.cookies.bind(py);
+
+        let mut synced = self
+            .synced_cookies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Remove previously-synced cookies from jar (handles expiry/removal)
+        for (name, domain, path) in synced.drain() {
+            let _ = jar.call_method1("clear", (domain.as_str(), path.as_str(), name.as_str()));
+        }
+
+        // Add current unexpired cookies from Rust store
+        let store = self
+            .rust_cookie_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for cs_cookie in store.iter_unexpired() {
+            let name = cs_cookie.name();
+            let value = cs_cookie.value();
+
+            // Extract resolved domain from CookieDomain enum
+            let domain = match &cs_cookie.domain {
+                CookieDomain::HostOnly(h) => h.clone(),
+                CookieDomain::Suffix(s) => format!(".{}", s),
+                _ => String::new(),
+            };
+            // Use raw cookie path with fallback
+            let path = cs_cookie.path().unwrap_or("/").to_string();
+            let secure = cs_cookie.secure().unwrap_or(false);
+            let http_only = cs_cookie.http_only().unwrap_or(false);
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("domain", &domain)?;
+            kwargs.set_item("path", &path)?;
+            kwargs.set_item("secure", secure)?;
+
+            if let CookieExpiration::AtUtc(dt) = &cs_cookie.expires {
+                kwargs.set_item("expires", dt.unix_timestamp())?;
+                kwargs.set_item("discard", false)?;
+            }
+
+            let rest = PyDict::new(py);
+            if http_only {
+                rest.set_item("HttpOnly", "")?;
+            } else {
+                rest.set_item("HttpOnly", py.None())?;
+            }
+            kwargs.set_item("rest", &rest)?;
+
+            let py_cookie = create_cookie.call((name, value), Some(&kwargs))?;
+            jar.call_method1("set_cookie", (&py_cookie,))?;
+
+            synced.insert((name.to_string(), domain, path));
+        }
+
+        Ok(())
+    }
+
+    /// Extract Set-Cookie headers from a response raw object and parse into Rust store.
+    fn extract_cookies_from_raw(
+        &self,
+        _py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+        response_raw: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        // Get _original_response.msg from raw
+        if !response_raw.hasattr("_original_response")? {
+            return Ok(());
+        }
+        let orig_resp = response_raw.getattr("_original_response")?;
+        if orig_resp.is_none() {
+            return Ok(());
+        }
+        let msg = orig_resp.getattr("msg")?;
+
+        // Get all Set-Cookie header values
+        let set_cookies_py = msg.call_method1("get_all", ("Set-Cookie",))?;
+        if set_cookies_py.is_none() {
+            return Ok(());
+        }
+        let set_cookies: Vec<String> = set_cookies_py.extract()?;
+        if set_cookies.is_empty() {
+            return Ok(());
+        }
+
+        // Get the request URL for domain context
+        let request_url: String = request.getattr("url")?.extract()?;
+
+        // Parse into Rust CookieStore
+        self.parse_response_set_cookies(&request_url, &set_cookies);
+
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -933,6 +1052,8 @@ impl Session {
 
         Ok(Session {
             clients: Mutex::new(IndexMap::new()),
+            rust_cookie_store: Mutex::new(CookieStore::new(None)),
+            synced_cookies: Mutex::new(HashSet::new()),
             headers: py_headers,
             cookies: py_cookies,
             auth: py.None(),
@@ -946,6 +1067,21 @@ impl Session {
             trust_env: true,
             adapters: py_adapters,
         })
+    }
+
+    /// Extract Set-Cookie headers from response into the Rust CookieStore
+    /// and sync to the Python session cookie jar.
+    /// Called from Python (resolve_redirects) and Rust (send).
+    #[pyo3(name = "_extract_cookies_to_session")]
+    fn extract_cookies_to_session_py(
+        &self,
+        py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+        response_raw: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        self.extract_cookies_from_raw(py, request, response_raw)?;
+        self.sync_store_to_jar(py)?;
+        Ok(())
     }
 
     #[pyo3(signature = (
@@ -1561,23 +1697,24 @@ impl Session {
         let dispatch_hook = hooks_mod.getattr("dispatch_hook")?;
         let r = dispatch_hook.call(("response", &hooks, &r), Some(&kwargs))?;
 
-        // Extract cookies from history
-        let cookies_mod = py.import("snekwest.cookies")?;
-        let extract_cookies = cookies_mod.getattr("extract_cookies_to_jar")?;
-        let session_cookies = slf.borrow().cookies.clone_ref(py);
-        let history = r.getattr("history")?;
-        if history.is_truthy()? {
-            let hist_list: Vec<Py<PyAny>> = history.extract()?;
-            for resp in &hist_list {
-                let resp_bound = resp.bind(py);
-                extract_cookies.call1((
-                    &session_cookies,
-                    resp_bound.getattr("request")?,
-                    resp_bound.getattr("raw")?,
-                ))?;
+        // Extract cookies from history into Rust CookieStore, then sync to Python jar
+        {
+            let this = slf.borrow();
+            let history = r.getattr("history")?;
+            if history.is_truthy()? {
+                let hist_list: Vec<Py<PyAny>> = history.extract()?;
+                for resp in &hist_list {
+                    let resp_bound = resp.bind(py);
+                    this.extract_cookies_from_raw(
+                        py,
+                        &resp_bound.getattr("request")?,
+                        &resp_bound.getattr("raw")?,
+                    )?;
+                }
             }
+            this.extract_cookies_from_raw(py, request.bind(py), &r.getattr("raw")?)?;
+            this.sync_store_to_jar(py)?;
         }
-        extract_cookies.call1((&session_cookies, &request, r.getattr("raw")?))?;
 
         // Handle redirects - call resolve_redirects via Python self (which inherits the mixin)
         if allow_redirects {
@@ -1809,5 +1946,140 @@ mod tests {
     fn test_rebuild_method_308_passthrough() {
         assert_eq!(rebuild_method("POST", 308), "POST");
         assert_eq!(rebuild_method("GET", 308), "GET");
+    }
+
+    // -- CookieStore tests --
+
+    #[test]
+    fn test_cookie_store_parse_simple() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("http://example.com/path").unwrap();
+        let result = store.parse("foo=bar", &url);
+        assert!(result.is_ok());
+        let cookies: Vec<_> = store.iter_any().collect();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name(), "foo");
+        assert_eq!(cookies[0].value(), "bar");
+    }
+
+    #[test]
+    fn test_cookie_store_parse_with_domain() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("http://example.com/").unwrap();
+        let _ = store.parse("foo=bar; Domain=example.com; Path=/", &url);
+        let cookies: Vec<_> = store.iter_any().collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(matches!(
+            &cookies[0].domain,
+            CookieDomain::Suffix(s) if s == "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_cookie_store_domain_matching() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("http://www.example.com/").unwrap();
+        let _ = store.parse("foo=bar; Domain=example.com", &url);
+        // Should match subdomains
+        let sub = url::Url::parse("http://sub.example.com/").unwrap();
+        let matches = store.matches(&sub);
+        assert_eq!(matches.len(), 1);
+        // Should not match different domain
+        let other = url::Url::parse("http://other.com/").unwrap();
+        let matches = store.matches(&other);
+        assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_cookie_store_path_matching() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("http://example.com/app").unwrap();
+        let _ = store.parse("foo=bar; Path=/app", &url);
+        // Should match path prefix
+        let sub = url::Url::parse("http://example.com/app/sub").unwrap();
+        let matches = store.matches(&sub);
+        assert_eq!(matches.len(), 1);
+        // Should not match different path
+        let other = url::Url::parse("http://example.com/other").unwrap();
+        let matches = store.matches(&other);
+        assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_cookie_store_secure_flag() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let _ = store.parse("sec=val; Secure", &url);
+        // Should match HTTPS
+        let matches = store.matches(&url);
+        assert_eq!(matches.len(), 1);
+        // Should not match HTTP
+        let http = url::Url::parse("http://example.com/").unwrap();
+        let matches = store.matches(&http);
+        assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_cookie_store_expiry_max_age_zero() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("http://example.com/").unwrap();
+        // First set a cookie
+        let _ = store.parse("foo=bar", &url);
+        assert_eq!(store.iter_unexpired().count(), 1);
+        // Now expire it with Max-Age=0
+        let _ = store.parse("foo=; Max-Age=0", &url);
+        assert_eq!(store.iter_unexpired().count(), 0);
+    }
+
+    #[test]
+    fn test_cookie_store_multiple_cookies() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("http://example.com/").unwrap();
+        let _ = store.parse("a=1", &url);
+        let _ = store.parse("b=2", &url);
+        let _ = store.parse("c=3", &url);
+        let cookies: Vec<_> = store.iter_any().collect();
+        assert_eq!(cookies.len(), 3);
+        let names: Vec<_> = cookies.iter().map(|c| c.name()).collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+    }
+
+    #[test]
+    fn test_cookie_store_update_existing() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("http://example.com/").unwrap();
+        let _ = store.parse("foo=old", &url);
+        let _ = store.parse("foo=new", &url);
+        let cookies: Vec<_> = store.iter_any().collect();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value(), "new");
+    }
+
+    #[test]
+    fn test_cookie_store_different_domains() {
+        let mut store = CookieStore::new(None);
+        let url1 = url::Url::parse("http://a.example.com/").unwrap();
+        let url2 = url::Url::parse("http://b.example.com/").unwrap();
+        let _ = store.parse("key=val1", &url1);
+        let _ = store.parse("key=val2", &url2);
+        // Different domains → separate cookies
+        let m1 = store.matches(&url1);
+        assert_eq!(m1.len(), 1);
+        assert_eq!(m1[0].value(), "val1");
+        let m2 = store.matches(&url2);
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].value(), "val2");
+    }
+
+    #[test]
+    fn test_cookie_store_httponly() {
+        let mut store = CookieStore::new(None);
+        let url = url::Url::parse("http://example.com/").unwrap();
+        let _ = store.parse("sess=abc; HttpOnly", &url);
+        let cookies: Vec<_> = store.iter_any().collect();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].http_only(), Some(true));
     }
 }
