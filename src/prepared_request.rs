@@ -1,3 +1,6 @@
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyDict, PyList, PyString, PyTuple};
@@ -1264,15 +1267,227 @@ fn encode_params(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>>
     Ok(data.clone().unbind())
 }
 
-/// Encode files for multipart upload (delegates to Python)
+/// Generate a random 32-character hex boundary string (same format as urllib3/uuid4.hex).
+fn generate_boundary() -> String {
+    let state = RandomState::new();
+    let mut h1 = state.build_hasher();
+    h1.write_u8(0);
+    let mut h2 = state.build_hasher();
+    h2.write_u8(1);
+    format!("{:016x}{:016x}", h1.finish(), h2.finish())
+}
+
+/// Encode files for multipart upload (pure Rust, no urllib3 dependency).
+///
+/// Builds an RFC 2046 multipart/form-data body from `files` and optional `data`.
+/// Returns a Python tuple `(body_bytes, content_type_string)`.
+///
+/// Supports all upstream file formats:
+/// - bare file-like objects: `{"field": file_obj}`
+/// - 2-tuple: `{"field": ("filename", data)}`
+/// - 3-tuple: `{"field": ("filename", data, "content-type")}`
+/// - 4-tuple: `{"field": ("filename", data, "content-type", {"Header": "val"})}`
 fn encode_files(
     py: Python<'_>,
     files: &Bound<'_, PyAny>,
     data: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let models_mod = py.import("snekwest.models")?;
-    let encode_fn = models_mod.getattr("_encode_files")?;
-    Ok(encode_fn.call1((files, data))?.unbind())
+    // Validation
+    if !files.is_truthy()? {
+        return Err(PyValueError::new_err("Files must be provided."));
+    }
+    let basestring = py.import("snekwest.compat")?.getattr("basestring")?;
+    if data.is_instance(&basestring)? {
+        return Err(PyValueError::new_err("Data must not be a string."));
+    }
+
+    let to_key_val_list = py.import("snekwest.utils")?.getattr("to_key_val_list")?;
+    let guess_filename_fn = py.import("snekwest.utils")?.getattr("guess_filename")?;
+    let list_cls = py.get_type::<PyList>();
+    let tuple_cls = py.get_type::<PyTuple>();
+
+    let boundary = generate_boundary();
+    let mut body: Vec<u8> = Vec::new();
+
+    // --- Process data fields ---
+    let data_kvl = to_key_val_list.call1((data,))?;
+    if !data_kvl.is_none() {
+        for pair in data_kvl.try_iter()? {
+            let pair = pair?;
+            let field = pair.get_item(0)?;
+            let val = pair.get_item(1)?;
+
+            // Decode bytes field names to UTF-8
+            let field_name = extract_field_name(&field)?;
+
+            // Normalize value to a list
+            let vals: Vec<Bound<'_, PyAny>> =
+                if val.is_instance(&basestring)? || !val.hasattr("__iter__")? {
+                    vec![val]
+                } else {
+                    val.try_iter()?.collect::<PyResult<Vec<_>>>()?
+                };
+
+            for v in vals {
+                if v.is_none() {
+                    continue;
+                }
+                // Convert to bytes: non-bytes → str → utf-8
+                let v_bytes: Vec<u8> = if v.is_instance_of::<PyBytes>() {
+                    v.extract()?
+                } else {
+                    v.str()?.to_string().into_bytes()
+                };
+
+                body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+                body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                        field_name
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(&v_bytes);
+                body.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+
+    // --- Process file fields ---
+    let files_kvl = to_key_val_list.call1((files,))?;
+    for pair in files_kvl.try_iter()? {
+        let pair = pair?;
+
+        // Validate: each element must unpack to (key, value).
+        // Strings like "bad file data" fail upstream with
+        // `ValueError: too many values to unpack (expected 2)`.
+        if !pair.is_instance(tuple_cls.as_any())? && !pair.is_instance(list_cls.as_any())? {
+            return Err(PyValueError::new_err(
+                "too many values to unpack (expected 2)",
+            ));
+        }
+
+        let k = pair.get_item(0)?;
+        let v = pair.get_item(1)?;
+
+        let field_name = extract_field_name(&k)?;
+
+        // Parse the file field into (filename, file_data_obj, content_type, custom_headers)
+        let (fn_name, fp, ft, fh): (
+            Option<String>,
+            Bound<'_, PyAny>,
+            Option<String>,
+            Option<Bound<'_, PyAny>>,
+        );
+
+        if v.is_instance(list_cls.as_any())? || v.is_instance(tuple_cls.as_any())? {
+            let len = v.len()?;
+            let fn_obj = v.get_item(0)?;
+            fn_name = if fn_obj.is_none() {
+                None
+            } else {
+                Some(fn_obj.str()?.to_string())
+            };
+            fp = v.get_item(1)?;
+            if len >= 3 {
+                let ft_obj = v.get_item(2)?;
+                ft = if ft_obj.is_none() {
+                    None
+                } else {
+                    Some(ft_obj.str()?.to_string())
+                };
+            } else {
+                ft = None;
+            }
+            if len >= 4 {
+                let fh_obj = v.get_item(3)?;
+                fh = if fh_obj.is_none() { None } else { Some(fh_obj) };
+            } else {
+                fh = None;
+            }
+        } else {
+            // Bare file-like object
+            let guessed = guess_filename_fn.call1((&v,))?;
+            fn_name = if guessed.is_none() {
+                Some(field_name.clone())
+            } else {
+                Some(guessed.str()?.to_string())
+            };
+            fp = v;
+            ft = None;
+            fh = None;
+        }
+
+        // Read file data
+        let fdata: Vec<u8> = if fp.is_none() {
+            continue;
+        } else if fp.is_instance_of::<PyString>() {
+            fp.str()?.to_string().into_bytes()
+        } else if let Ok(bytes) = fp.extract::<Vec<u8>>() {
+            // Handles both bytes and bytearray
+            bytes
+        } else if fp.hasattr("read")? {
+            let result = fp.call_method0("read")?;
+            if let Ok(bytes) = result.extract::<Vec<u8>>() {
+                bytes
+            } else {
+                result.str()?.to_string().into_bytes()
+            }
+        } else {
+            fp.str()?.to_string().into_bytes()
+        };
+
+        // Write part header
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+
+        // Content-Disposition
+        let mut cd = format!("Content-Disposition: form-data; name=\"{}\"", field_name);
+        if let Some(ref name) = fn_name {
+            cd.push_str(&format!("; filename=\"{}\"", name));
+        }
+        cd.push_str("\r\n");
+        body.extend_from_slice(cd.as_bytes());
+
+        // Content-Type (only if provided)
+        if let Some(ref ct) = ft {
+            body.extend_from_slice(format!("Content-Type: {}\r\n", ct).as_bytes());
+        }
+
+        // Custom per-part headers
+        if let Some(ref headers) = fh {
+            for item in headers.call_method0("items")?.try_iter()? {
+                let item = item?;
+                let hname = item.get_item(0)?.str()?.to_string();
+                let hval = item.get_item(1)?.str()?.to_string();
+                body.extend_from_slice(format!("{}: {}\r\n", hname, hval).as_bytes());
+            }
+        }
+
+        // Separator + data
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(&fdata);
+        body.extend_from_slice(b"\r\n");
+    }
+
+    // Closing boundary
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let body_bytes = PyBytes::new(py, &body);
+    let ct_str = PyString::new(py, &content_type);
+    let result = PyTuple::new(py, [body_bytes.into_any(), ct_str.into_any()])?;
+    Ok(result.into_any().unbind())
+}
+
+/// Extract a field name from a Python object, decoding bytes to UTF-8.
+fn extract_field_name(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    if obj.is_instance_of::<PyBytes>() {
+        let bytes: Vec<u8> = obj.extract()?;
+        String::from_utf8(bytes)
+            .map_err(|e| PyValueError::new_err(format!("Field name is not valid UTF-8: {}", e)))
+    } else {
+        Ok(obj.str()?.to_string())
+    }
 }
 
 // ============================================================================
@@ -1567,5 +1782,29 @@ mod tests {
         assert!(super::cookie_matches_url("", "/app", false, None, &url));
         assert!(super::cookie_matches_url("", "/", false, None, &url));
         assert!(!super::cookie_matches_url("", "/other", false, None, &url));
+    }
+
+    // ---- generate_boundary tests ----
+
+    #[test]
+    fn test_generate_boundary_length() {
+        let b = super::generate_boundary();
+        assert_eq!(b.len(), 32, "boundary must be 32 hex chars");
+    }
+
+    #[test]
+    fn test_generate_boundary_hex_chars() {
+        let b = super::generate_boundary();
+        assert!(
+            b.chars().all(|c| c.is_ascii_hexdigit()),
+            "boundary must contain only hex digits"
+        );
+    }
+
+    #[test]
+    fn test_generate_boundary_unique() {
+        let a = super::generate_boundary();
+        let b = super::generate_boundary();
+        assert_ne!(a, b, "consecutive boundaries must differ");
     }
 }
