@@ -355,7 +355,6 @@ class HTTPAdapter(BaseAdapter):
                 url=url,
                 headers=headers,
                 data=data,
-                allow_redirects=False,
                 timeout=timeout,
                 verify=rust_verify,
                 cert=rust_cert,

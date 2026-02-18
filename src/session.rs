@@ -955,7 +955,6 @@ impl Session {
         files = None,
         auth = None,
         timeout = None,
-        allow_redirects = None,
         proxies = None,
         stream = None,
         verify = None,
@@ -975,7 +974,6 @@ impl Session {
         files: Option<HashMap<String, String>>,
         auth: Option<(String, String)>,
         timeout: Option<TimeoutParameter>,
-        allow_redirects: Option<bool>,
         proxies: Option<HashMap<String, String>>,
         stream: Option<bool>,
         verify: Option<VerifyParameter>,
@@ -985,21 +983,8 @@ impl Session {
         validate_url(py, &url)?;
 
         let req_params = RequestParams::from_args(
-            method,
-            url,
-            params,
-            data,
-            json,
-            headers,
-            cookies,
-            files,
-            auth,
-            timeout,
-            allow_redirects,
-            proxies,
-            stream,
-            verify,
-            cert,
+            method, url, params, data, json, headers, cookies, files, auth, timeout, proxies,
+            stream, verify, cert,
         );
 
         let raw = self.do_request(req_params)?;
