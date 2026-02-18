@@ -121,8 +121,8 @@ pub struct RawResponseData {
 
 #[pyclass(dict)]
 pub struct Response {
-    // Content state
-    content_bytes: Option<Vec<u8>>,
+    // Content state — Arc for cheap cloning in iter_content
+    content_bytes: Option<Arc<Vec<u8>>>,
     content_loaded: bool,
     content_consumed: bool,
 
@@ -228,7 +228,7 @@ impl Response {
                 ns_kwargs.set_item("msg", &msg)?;
                 let fake_resp = ns_cls.call((), Some(&ns_kwargs))?;
                 bio.setattr("_original_response", &fake_resp)?;
-                (Some(data.body), true, true, Some(bio.unbind()))
+                (Some(Arc::new(data.body)), true, true, Some(bio.unbind()))
             };
 
         // 8. Build request PreparedRequest
@@ -315,7 +315,7 @@ impl Response {
             }
             all_bytes.extend(chunk);
         }
-        self.content_bytes = Some(all_bytes);
+        self.content_bytes = Some(Arc::new(all_bytes));
         self.content_loaded = true;
         Ok(())
     }
@@ -335,17 +335,7 @@ impl Response {
 
         let encoding = match encoding {
             Some(e) => e,
-            None => {
-                // Use apparent_encoding
-                let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
-                if !chardet.is_none() {
-                    let result = chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
-                    let enc: Option<String> = result.get_item("encoding")?.extract()?;
-                    enc.unwrap_or_else(|| "utf-8".to_string())
-                } else {
-                    "utf-8".to_string()
-                }
-            }
+            None => detect_encoding(py, bytes)?,
         };
 
         // Decode
@@ -361,6 +351,19 @@ impl Response {
     }
 }
 
+/// Detect encoding of byte content using chardet.
+/// Single source of truth — used by both `decode_text` and `apparent_encoding`.
+fn detect_encoding(py: Python<'_>, bytes: &[u8]) -> PyResult<String> {
+    let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
+    if !chardet.is_none() {
+        let result = chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
+        let enc: Option<String> = result.get_item("encoding")?.extract()?;
+        Ok(enc.unwrap_or_else(|| "utf-8".to_string()))
+    } else {
+        Ok("utf-8".to_string())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure Rust helpers
 // ---------------------------------------------------------------------------
@@ -369,9 +372,23 @@ impl Response {
 ///
 /// Each character in `input` is treated as a latin1 byte value (0x00–0xFF).
 /// The collected bytes are then decoded as UTF-8.
-fn latin1_to_utf8(input: &str) -> String {
-    let bytes: Vec<u8> = input.chars().map(|c| c as u32 as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
+/// Returns `Err` if any character is above U+00FF (not representable in latin1).
+fn latin1_to_utf8(input: &str) -> Result<String, String> {
+    let bytes: Vec<u8> = input
+        .chars()
+        .map(|c| {
+            let cp = c as u32;
+            if cp > 0xFF {
+                Err(format!(
+                    "'latin-1' codec can't encode character '\\u{:04x}' in position",
+                    cp
+                ))
+            } else {
+                Ok(cp as u8)
+            }
+        })
+        .collect::<Result<Vec<u8>, String>>()?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +398,22 @@ fn latin1_to_utf8(input: &str) -> String {
 #[pymethods]
 #[allow(non_snake_case)]
 impl Response {
+    #[classattr]
+    fn __attrs__() -> Vec<&'static str> {
+        vec![
+            "_content",
+            "status_code",
+            "headers",
+            "url",
+            "history",
+            "encoding",
+            "reason",
+            "cookies",
+            "elapsed",
+            "request",
+        ]
+    }
+
     #[new]
     fn py_new(py: Python<'_>) -> PyResult<Self> {
         let cid = Py::new(py, CaseInsensitiveDict::new_empty())?;
@@ -608,7 +641,7 @@ impl Response {
         } else {
             let bytes: Vec<u8> = v.extract()?;
             self.content_loaded = true;
-            self.content_bytes = Some(bytes);
+            self.content_bytes = Some(Arc::new(bytes));
         }
         Ok(())
     }
@@ -660,21 +693,28 @@ impl Response {
     }
 
     /// Return the redirect target URL with latin1-to-utf8 re-encoding, or None.
-    fn get_redirect_target(&self, py: Python<'_>) -> Option<String> {
+    fn get_redirect_target(&self, py: Python<'_>) -> PyResult<Option<String>> {
         let has_location = match &self.headers_inner {
             Some(h) => h.bind(py).borrow().contains("location"),
             None => false,
         };
         let status = self.status_code.unwrap_or(0);
         if !(has_location && REDIRECT_STATI.contains(&status)) {
-            return None;
+            return Ok(None);
         }
-        let location: String = self
+        let location: Option<String> = self
             .headers_inner
             .as_ref()
             .and_then(|h| h.bind(py).borrow().get_value(py, "location"))
-            .and_then(|v| v.extract(py).ok())?;
-        Some(latin1_to_utf8(&location))
+            .and_then(|v| v.extract(py).ok());
+        match location {
+            Some(loc) => {
+                let utf8 = latin1_to_utf8(&loc)
+                    .map_err(pyo3::exceptions::PyUnicodeEncodeError::new_err)?;
+                Ok(Some(utf8))
+            }
+            None => Ok(None),
+        }
     }
 
     #[getter]
@@ -691,15 +731,12 @@ impl Response {
     fn apparent_encoding(&mut self, py: Python<'_>) -> PyResult<String> {
         self.ensure_content_loaded(py)?;
         self.content_consumed = true;
-        let chardet = py.import("snekwest.compat")?.getattr("chardet")?;
-        if !chardet.is_none() {
-            let bytes = self.content_bytes.as_deref().unwrap_or(b"");
-            let result = chardet.call_method1("detect", (PyBytes::new(py, bytes),))?;
-            let enc: Option<String> = result.get_item("encoding")?.extract()?;
-            Ok(enc.unwrap_or_else(|| "utf-8".to_string()))
-        } else {
-            Ok("utf-8".to_string())
-        }
+        let bytes = self
+            .content_bytes
+            .as_ref()
+            .map(|b| b.as_slice())
+            .unwrap_or(b"");
+        detect_encoding(py, bytes)
     }
 
     #[getter]
@@ -736,10 +773,11 @@ impl Response {
         self.ensure_content_loaded(py)?;
         self.content_consumed = true;
 
-        let bytes = match &self.content_bytes {
-            Some(b) => b.clone(),
-            None => Vec::new(),
-        };
+        let bytes: &[u8] = self
+            .content_bytes
+            .as_ref()
+            .map(|b| b.as_slice())
+            .unwrap_or(b"");
 
         let json_mod = py.import("json")?;
         let requests_jde = py
@@ -753,9 +791,9 @@ impl Response {
             .is_some_and(|e| e.bind(py).is_truthy().unwrap_or(false));
         if !has_encoding && bytes.len() > 3 {
             let guess_fn = py.import("snekwest.utils")?.getattr("guess_json_utf")?;
-            let enc: Option<String> = guess_fn.call1((PyBytes::new(py, &bytes),))?.extract()?;
+            let enc: Option<String> = guess_fn.call1((PyBytes::new(py, bytes),))?.extract()?;
             if let Some(enc) = enc {
-                let decoded = PyBytes::new(py, &bytes).call_method1("decode", (&enc,));
+                let decoded = PyBytes::new(py, bytes).call_method1("decode", (&enc,));
                 if let Ok(decoded) = decoded {
                     match json_mod.call_method("loads", (&decoded,), kwargs) {
                         Ok(result) => return Ok(result.unbind()),
@@ -1002,7 +1040,7 @@ impl Response {
 
 #[pyclass]
 pub struct ContentIterator {
-    content: Option<Vec<u8>>,
+    content: Option<Arc<Vec<u8>>>,
     pos: usize,
     raw: Option<Py<PyAny>>,
     chunk_size: usize,
@@ -1190,7 +1228,7 @@ mod tests {
     fn test_latin1_to_utf8_ascii() {
         // Pure ASCII input should pass through unchanged.
         let input = "https://example.com/path?q=hello";
-        let result = latin1_to_utf8(input);
+        let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "https://example.com/path?q=hello");
     }
 
@@ -1234,7 +1272,7 @@ mod tests {
         // For this test, use a URL with a path containing "é" encoded as UTF-8
         // bytes stored in latin1: "/caf\u{00c3}\u{00a9}" → "/café"
         let input = "/caf\u{00c3}\u{00a9}";
-        let result = latin1_to_utf8(input);
+        let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "/caf\u{00e9}"); // "/café" in proper UTF-8
     }
 
@@ -1242,7 +1280,7 @@ mod tests {
     fn test_latin1_to_utf8_empty() {
         // Empty string should produce empty string.
         let input = "";
-        let result = latin1_to_utf8(input);
+        let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "");
     }
 
@@ -1254,7 +1292,131 @@ mod tests {
         // latin1_to_utf8 should extract bytes [0xC3, 0xA9] and decode
         // them as UTF-8 to produce "é" (U+00E9).
         let input = "\u{00c3}\u{00a9}";
-        let result = latin1_to_utf8(input);
+        let result = latin1_to_utf8(input).unwrap();
         assert_eq!(result, "\u{00e9}"); // "é"
+    }
+
+    // -- latin1_to_utf8 error case (#51/#53) --
+
+    #[test]
+    fn test_latin1_to_utf8_above_ff_error() {
+        // U+0100 is above the latin1 range — must return Err
+        let input = "\u{0100}";
+        assert!(latin1_to_utf8(input).is_err());
+    }
+
+    #[test]
+    fn test_latin1_to_utf8_boundary_ff() {
+        // U+00FF is the highest valid latin1 char — byte 0xFF
+        let input = "\u{00ff}";
+        let result = latin1_to_utf8(input).unwrap();
+        // 0xFF alone is invalid UTF-8, so from_utf8_lossy replaces it
+        assert!(result.contains('\u{FFFD}') || result.len() > 0);
+    }
+
+    #[test]
+    fn test_latin1_to_utf8_mixed_with_invalid() {
+        // "a\u{0200}b" — the U+0200 char is above 0xFF
+        assert!(latin1_to_utf8("a\u{0200}b").is_err());
+    }
+
+    // -- REDIRECT_STATI (#53) --
+
+    #[test]
+    fn test_redirect_stati_completeness() {
+        assert_eq!(REDIRECT_STATI.len(), 5);
+        assert!(REDIRECT_STATI.contains(&301));
+        assert!(REDIRECT_STATI.contains(&302));
+        assert!(REDIRECT_STATI.contains(&303));
+        assert!(REDIRECT_STATI.contains(&307));
+        assert!(REDIRECT_STATI.contains(&308));
+    }
+
+    #[test]
+    fn test_redirect_stati_non_redirect() {
+        assert!(!REDIRECT_STATI.contains(&200));
+        assert!(!REDIRECT_STATI.contains(&404));
+        assert!(!REDIRECT_STATI.contains(&304));
+    }
+
+    // -- ContentIterator cached-content chunking (#53) --
+
+    #[test]
+    fn test_content_iterator_chunk_all_at_once() {
+        let data = Arc::new(vec![1, 2, 3, 4, 5]);
+        let mut iter = ContentIterator {
+            content: Some(data),
+            pos: 0,
+            raw: None,
+            chunk_size: 0, // 0 = all at once
+            done: false,
+        };
+        // First call: full content
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let chunk = iter.__next__(py).unwrap();
+            assert!(chunk.is_some());
+            let bytes: Vec<u8> = chunk.unwrap().extract(py).unwrap();
+            assert_eq!(bytes, vec![1, 2, 3, 4, 5]);
+            // Second call: done
+            let chunk2 = iter.__next__(py).unwrap();
+            assert!(chunk2.is_none());
+        });
+    }
+
+    #[test]
+    fn test_content_iterator_chunk_size_2() {
+        let data = Arc::new(vec![1, 2, 3, 4, 5]);
+        let mut iter = ContentIterator {
+            content: Some(data),
+            pos: 0,
+            raw: None,
+            chunk_size: 2,
+            done: false,
+        };
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let c1: Vec<u8> = iter.__next__(py).unwrap().unwrap().extract(py).unwrap();
+            assert_eq!(c1, vec![1, 2]);
+            let c2: Vec<u8> = iter.__next__(py).unwrap().unwrap().extract(py).unwrap();
+            assert_eq!(c2, vec![3, 4]);
+            let c3: Vec<u8> = iter.__next__(py).unwrap().unwrap().extract(py).unwrap();
+            assert_eq!(c3, vec![5]);
+            let c4 = iter.__next__(py).unwrap();
+            assert!(c4.is_none());
+        });
+    }
+
+    #[test]
+    fn test_content_iterator_empty_content() {
+        let data = Arc::new(vec![]);
+        let mut iter = ContentIterator {
+            content: Some(data),
+            pos: 0,
+            raw: None,
+            chunk_size: 0,
+            done: false,
+        };
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let chunk = iter.__next__(py).unwrap();
+            assert!(chunk.is_none());
+        });
+    }
+
+    #[test]
+    fn test_content_iterator_no_content_no_raw() {
+        let mut iter = ContentIterator {
+            content: None,
+            pos: 0,
+            raw: None,
+            chunk_size: 1024,
+            done: false,
+        };
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let chunk = iter.__next__(py).unwrap();
+            assert!(chunk.is_none());
+        });
     }
 }
