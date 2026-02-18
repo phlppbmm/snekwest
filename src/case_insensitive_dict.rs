@@ -124,6 +124,15 @@ impl CaseInsensitiveDict {
         ))
     }
 
+    /// Build a temporary PyDict from the store for view methods.
+    fn to_pydict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (_lower, (orig, val)) in &self.store {
+            dict.set_item(orig, val.bind(py))?;
+        }
+        Ok(dict)
+    }
+
     fn update_from_kwargs(&mut self, py: Python<'_>, kwargs: &Bound<'_, PyDict>) -> PyResult<()> {
         for (k, v) in kwargs.iter() {
             let key_str: String = k.extract()?;
@@ -184,8 +193,11 @@ impl CaseInsensitiveDict {
         }
     }
 
-    fn __contains__(&self, key: &str) -> bool {
-        self.store.contains_key(&key.to_lowercase())
+    fn __contains__(&self, key: &Bound<'_, PyAny>) -> bool {
+        match key.extract::<String>() {
+            Ok(s) => self.store.contains_key(&s.to_lowercase()),
+            Err(_) => false, // Non-string keys (bytes, int, None) can never match
+        }
     }
 
     fn __len__(&self) -> usize {
@@ -336,30 +348,19 @@ impl CaseInsensitiveDict {
         }
     }
 
-    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.store.values().map(|(orig, _)| orig.clone()).collect();
-        PyList::new(py, &keys)
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dict = self.to_pydict(py)?;
+        dict.call_method0("keys")
     }
 
-    fn values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let vals: Vec<&Py<PyAny>> = self.store.values().map(|(_, val)| val).collect();
-        let list = PyList::empty(py);
-        for v in vals {
-            list.append(v.bind(py))?;
-        }
-        Ok(list)
+    fn values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dict = self.to_pydict(py)?;
+        dict.call_method0("values")
     }
 
-    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let list = PyList::empty(py);
-        for (_lower, (orig, val)) in &self.store {
-            let tuple = PyTuple::new(
-                py,
-                &[orig.into_pyobject(py)?.into_any(), val.bind(py).clone()],
-            )?;
-            list.append(tuple)?;
-        }
-        Ok(list)
+    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dict = self.to_pydict(py)?;
+        dict.call_method0("items")
     }
 
     fn lower_items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
@@ -421,52 +422,140 @@ impl CaseInsensitiveDictIter {
 
 #[cfg(test)]
 mod tests {
-    // Tests for CaseInsensitiveDict methods.
-    //
-    // NOTE: CaseInsensitiveDict contains Py<PyAny> in its store, which means
-    // it cannot be instantiated in `cargo test` (the extension-module feature
-    // prevents linking against libpython). The real behavioral tests for
-    // clear(), popitem(), and __copy__() live in Group A (Python test suite).
-    // These Rust tests verify compile-time invariants and structural assertions.
+    use super::*;
+
+    fn init_python() {
+        Python::initialize();
+    }
+
+    // -- new_empty / basic Rust API --
 
     #[test]
-    fn test_clear_method_exists() {
-        // Compile-time assertion: CaseInsensitiveDict has a clear() method
-        // with the correct signature fn(&mut self). If this test compiles,
-        // the method exists and is callable.
-        // The real behavioral test (clear empties the store) runs in Group A.
-        fn _assert_clear_signature(cid: &mut super::CaseInsensitiveDict) {
+    fn test_new_empty() {
+        let cid = CaseInsensitiveDict::new_empty();
+        assert_eq!(cid.store.len(), 0);
+    }
+
+    #[test]
+    fn test_set_and_get() {
+        init_python();
+        Python::attach(|py| {
+            let mut cid = CaseInsensitiveDict::new_empty();
+            let val = "text/html".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "Content-Type", val).unwrap();
+            let result = cid.get_value(py, "content-type");
+            assert!(result.is_some());
+            let s: String = result.unwrap().extract(py).unwrap();
+            assert_eq!(s, "text/html");
+        });
+    }
+
+    #[test]
+    fn test_case_insensitive_contains() {
+        init_python();
+        Python::attach(|py| {
+            let mut cid = CaseInsensitiveDict::new_empty();
+            let val = "value".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "X-Custom-Header", val).unwrap();
+            assert!(cid.contains("x-custom-header"));
+            assert!(cid.contains("X-CUSTOM-HEADER"));
+            assert!(!cid.contains("other"));
+        });
+    }
+
+    #[test]
+    fn test_last_key_wins() {
+        init_python();
+        Python::attach(|py| {
+            let mut cid = CaseInsensitiveDict::new_empty();
+            let val1 = "first".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "Key", val1).unwrap();
+            let val2 = "second".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "KEY", val2).unwrap();
+            // Last value wins
+            let result: String = cid.get_value(py, "key").unwrap().extract(py).unwrap();
+            assert_eq!(result, "second");
+            // Last key casing wins
+            let keys: Vec<(&str, &Py<PyAny>)> = cid.iter_items().collect();
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].0, "KEY");
+        });
+    }
+
+    #[test]
+    fn test_iter_items() {
+        init_python();
+        Python::attach(|py| {
+            let mut cid = CaseInsensitiveDict::new_empty();
+            let v1 = "1".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "A", v1).unwrap();
+            let v2 = "2".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "B", v2).unwrap();
+            let items: Vec<(&str, &Py<PyAny>)> = cid.iter_items().collect();
+            assert_eq!(items.len(), 2);
+        });
+    }
+
+    // -- __contains__ with non-string keys (Issue #87) --
+
+    #[test]
+    fn test_contains_bytes_key_returns_false() {
+        init_python();
+        Python::attach(|py| {
+            let mut cid = CaseInsensitiveDict::new_empty();
+            let val = "text/html".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "Content-Type", val).unwrap();
+            let bytes_key = pyo3::types::PyBytes::new(py, b"content-type");
+            assert!(!cid.__contains__(bytes_key.as_any()));
+        });
+    }
+
+    #[test]
+    fn test_contains_int_key_returns_false() {
+        init_python();
+        Python::attach(|py| {
+            let mut cid = CaseInsensitiveDict::new_empty();
+            let val = "value".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "42", val).unwrap();
+            let int_key = pyo3::types::PyInt::new(py, 42);
+            assert!(!cid.__contains__(int_key.as_any()));
+        });
+    }
+
+    // -- clear --
+
+    #[test]
+    fn test_clear() {
+        init_python();
+        Python::attach(|py| {
+            let mut cid = CaseInsensitiveDict::new_empty();
+            let val = "v".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "Key", val).unwrap();
+            assert_eq!(cid.store.len(), 1);
             cid.clear();
-        }
+            assert_eq!(cid.store.len(), 0);
+        });
     }
 
-    // -- popitem() tests (Issue #83) --
+    // -- copy independence --
 
     #[test]
-    fn test_popitem_method_exists() {
-        // Compile-time assertion: CaseInsensitiveDict has a popitem() method
-        // with signature fn(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>>.
-        // Returns a tuple of (original_key, value) or raises KeyError if empty.
-        fn _assert_popitem_signature(
-            cid: &mut super::CaseInsensitiveDict,
-            py: pyo3::Python<'_>,
-        ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-            cid.popitem(py)
-        }
-    }
+    fn test_copy_independence() {
+        init_python();
+        Python::attach(|py| {
+            let mut cid = CaseInsensitiveDict::new_empty();
+            let val = "original".into_pyobject(py).unwrap().into_any();
+            cid.set_item(py, "Key", val).unwrap();
 
-    // -- __copy__() tests (Issue #84) --
+            let mut copy = cid.copy(py);
+            let new_val = "modified".into_pyobject(py).unwrap().into_any();
+            copy.set_item(py, "Key", new_val).unwrap();
 
-    #[test]
-    fn test_copy_method_exists() {
-        // Compile-time assertion: CaseInsensitiveDict has a __copy__() method
-        // with signature fn(&self, py: Python<'_>) -> Self.
-        // This enables copy.copy() support.
-        fn _assert_copy_signature(
-            cid: &super::CaseInsensitiveDict,
-            py: pyo3::Python<'_>,
-        ) -> super::CaseInsensitiveDict {
-            cid.__copy__(py)
-        }
+            // Original should be unchanged
+            let orig: String = cid.get_value(py, "key").unwrap().extract(py).unwrap();
+            assert_eq!(orig, "original");
+            let copied: String = copy.get_value(py, "key").unwrap().extract(py).unwrap();
+            assert_eq!(copied, "modified");
+        });
     }
 }
