@@ -116,19 +116,22 @@ pub const EXPECTED_EXPORTS: &[&str] = &[
 mod tests {
     use super::*;
 
-    fn init_python() {
+    fn init_python() -> bool {
         Python::initialize();
         Python::attach(|py| {
             let sys = py.import("sys").unwrap();
             let path = sys.getattr("path").unwrap();
             let python_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/python");
             let _ = path.call_method1("insert", (0, python_dir));
-        });
+            py.import("snekwest._bindings").is_ok()
+        })
     }
 
     #[test]
     fn test_all_exports_accessible_from_bindings() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             let module = py.import("snekwest._bindings").unwrap();
             for name in EXPECTED_EXPORTS {

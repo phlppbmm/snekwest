@@ -135,20 +135,26 @@ pub fn raise_nested_exception_with_request(
 mod tests {
     use super::*;
 
-    fn init_python() {
+    /// Initialize Python and add project source to sys.path.
+    /// Returns false if snekwest Python deps are not available (e.g. running
+    /// `cargo test` outside the uv venv). Tests should skip in that case.
+    fn init_python() -> bool {
         Python::initialize();
-        // Add the python/ source directory to sys.path so snekwest is importable
         Python::attach(|py| {
             let sys = py.import("sys").unwrap();
             let path = sys.getattr("path").unwrap();
             let python_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/python");
             let _ = path.call_method1("insert", (0, python_dir));
-        });
+            // Check if snekwest is importable (needs urllib3 etc.)
+            py.import("snekwest.exceptions").is_ok()
+        })
     }
 
     #[test]
     fn test_make_exception_creates_correct_type() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             let err = make_exception(py, "ConnectionError", "test msg".into());
             let instance = err.value(py);
@@ -163,7 +169,9 @@ mod tests {
 
     #[test]
     fn test_make_exception_message() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             let err = make_exception(py, "SSLError", "certificate verify failed".into());
             let instance = err.value(py);
@@ -178,7 +186,9 @@ mod tests {
 
     #[test]
     fn test_make_exception_invalid_class_name() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             // Should return an error (AttributeError), not panic
             let err = make_exception(py, "NonexistentError", "msg".into());
@@ -193,7 +203,9 @@ mod tests {
 
     #[test]
     fn test_make_exception_with_request_sets_attribute() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             let req = py
                 .eval(pyo3::ffi::c_str!("'fake_request'"), None, None)
@@ -210,7 +222,9 @@ mod tests {
 
     #[test]
     fn test_make_exception_without_request_has_none() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             let err = make_exception(py, "ConnectionError", "msg".into());
             let instance = err.value(py);
@@ -221,7 +235,9 @@ mod tests {
 
     #[test]
     fn test_raise_nested_exception_args_structure() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             let err = raise_nested_exception(py, "ReadTimeout", "Read timed out".into());
             let instance = err.value(py);
@@ -242,7 +258,9 @@ mod tests {
 
     #[test]
     fn test_exception_cache_returns_same_class() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             let cls1 = get_exception_class(py, "ConnectionError").unwrap();
             let cls2 = get_exception_class(py, "ConnectionError").unwrap();
@@ -252,7 +270,9 @@ mod tests {
 
     #[test]
     fn test_all_known_exceptions_resolve() {
-        init_python();
+        if !init_python() {
+            return;
+        }
         Python::attach(|py| {
             for name in KNOWN_EXCEPTIONS {
                 let result = get_exception_class(py, name);

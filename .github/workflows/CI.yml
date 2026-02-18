@@ -45,7 +45,7 @@ jobs:
       - name: Test Group A (Python — external behavior)
         run: uv run pytest python-requests/tests/test_requests.py -q -c pyproject.toml
       - name: Test Group C (Rust unit tests)
-        run: cargo test
+        run: uv run cargo test
 
   # ---- Lint ----
   lint:
