@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::exceptions::{raise_exception, raise_nested_exception};
+use crate::exceptions::{
+    make_exception, make_exception_with_request, raise_nested_exception_with_request,
+};
 use crate::request_params::CertParameter;
 use crate::request_params::{DataParameter, RequestParams, TimeoutParameter, VerifyParameter};
 use crate::response::{RawResponseData, Response, StreamingInner};
@@ -158,7 +160,7 @@ fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
     // Empty or whitespace-only
     let trimmed = url.trim();
     if trimmed.is_empty() {
-        return Err(raise_exception(
+        return Err(make_exception(
             py,
             "InvalidURL",
             format!("Invalid URL {}: No host supplied", repr_str(url)),
@@ -177,7 +179,7 @@ fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
         if is_valid_scheme {
             let lower_scheme = scheme.to_lowercase();
             if lower_scheme != "http" && lower_scheme != "https" {
-                return Err(raise_exception(
+                return Err(make_exception(
                     py,
                     "InvalidSchema",
                     format!("No connection adapters were found for {:?}", url),
@@ -189,7 +191,7 @@ fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
             let after_slashes = after_scheme.trim_start_matches('/');
 
             if after_slashes.is_empty() {
-                return Err(raise_exception(
+                return Err(make_exception(
                     py,
                     "InvalidURL",
                     format!("Invalid URL {:?}: No host supplied", url),
@@ -207,7 +209,7 @@ fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
             // Detect bare IPv6 addresses (without brackets)
             // e.g. http://fe80::5054:ff:fe5a:fc0 is invalid, should be http://[fe80::...]/
             if !host.starts_with('[') && host.chars().filter(|c| *c == ':').count() > 1 {
-                return Err(raise_exception(
+                return Err(make_exception(
                     py,
                     "InvalidURL",
                     format!("Invalid URL {:?}: Invalid IPv6 URL", url),
@@ -216,14 +218,14 @@ fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
 
             let host_no_port = host.split(':').next().unwrap_or("");
             if host_no_port.is_empty() {
-                return Err(raise_exception(
+                return Err(make_exception(
                     py,
                     "InvalidURL",
                     format!("Invalid URL {:?}: No host supplied", url),
                 ));
             }
             if host_no_port.starts_with('*') || host_no_port.starts_with('.') {
-                return Err(raise_exception(
+                return Err(make_exception(
                     py,
                     "InvalidURL",
                     format!("Invalid URL {:?}: Invalid host", url),
@@ -238,14 +240,14 @@ fn validate_url(py: Python<'_>, url: &str) -> PyResult<()> {
     // or just a bare word (MissingSchema)
     if trimmed.contains(':') || trimmed.contains('/') {
         // Looks like host:port or host/path without a scheme
-        return Err(raise_exception(
+        return Err(make_exception(
             py,
             "InvalidSchema",
             format!("No connection adapters were found for {:?}", url),
         ));
     }
 
-    Err(raise_exception(
+    Err(make_exception(
         py,
         "MissingSchema",
         format!(
@@ -312,35 +314,37 @@ fn map_reqwest_error(
     e: reqwest::Error,
     had_explicit_connect_timeout: bool,
     has_proxies: bool,
+    request: Option<&Py<PyAny>>,
 ) -> PyErr {
     let msg = full_error_chain(&e);
 
     // 1. SSL/TLS errors — check source chain (not URL text)
     if is_ssl_error(&e) {
-        return raise_exception(py, "SSLError", msg);
+        return make_exception_with_request(py, "SSLError", msg, request);
     }
 
     // 2. Connection errors that are NOT timeouts (connection refused, reset, etc.)
     if e.is_connect() && !e.is_timeout() {
         let lower = msg.to_lowercase();
         if has_proxies || lower.contains("proxy") || lower.contains("tunnel") {
-            return raise_exception(py, "ProxyError", msg);
+            return make_exception_with_request(py, "ProxyError", msg, request);
         }
-        return raise_exception(py, "ConnectionError", msg);
+        return make_exception_with_request(py, "ConnectionError", msg, request);
     }
 
     // 3. Timeout errors
     if e.is_timeout() {
         if e.is_connect() {
             if had_explicit_connect_timeout {
-                return raise_nested_exception(
+                return raise_nested_exception_with_request(
                     py,
                     "ConnectTimeout",
                     format!("ConnectTimeout: connection timed out. {}", msg),
+                    request,
                 );
             }
             // Connection attempt timed out under a general/single timeout
-            return raise_exception(py, "ConnectionError", msg);
+            return make_exception_with_request(py, "ConnectionError", msg, request);
         }
         // Read / general timeout
         let read_msg = if msg.to_lowercase().contains("timed out") {
@@ -348,32 +352,32 @@ fn map_reqwest_error(
         } else {
             format!("Read timed out. {}", msg)
         };
-        return raise_nested_exception(py, "ReadTimeout", read_msg);
+        return raise_nested_exception_with_request(py, "ReadTimeout", read_msg, request);
     }
 
     // 4. Body/decode errors
     if e.is_decode() {
-        return raise_exception(py, "ContentDecodingError", msg);
+        return make_exception_with_request(py, "ContentDecodingError", msg, request);
     }
 
     // 5. Redirect errors
     if e.is_redirect() {
-        return raise_exception(py, "TooManyRedirects", msg);
+        return make_exception_with_request(py, "TooManyRedirects", msg, request);
     }
 
     // 6. Builder errors
     if e.is_builder() {
-        return raise_exception(py, "InvalidURL", msg);
+        return make_exception_with_request(py, "InvalidURL", msg, request);
     }
 
     // 7. Connection closed / chunked encoding
     let lower = msg.to_lowercase();
     if lower.contains("connection closed") || lower.contains("incompletemessage") {
-        return raise_exception(py, "ChunkedEncodingError", msg);
+        return make_exception_with_request(py, "ChunkedEncodingError", msg, request);
     }
 
     // Default
-    raise_exception(py, "ConnectionError", msg)
+    make_exception_with_request(py, "ConnectionError", msg, request)
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -455,7 +459,7 @@ fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
     // Must have :// (double slash) after scheme.
     // Single-slash URLs like "http:/foo" are malformed.
     if !after_scheme.starts_with("//") {
-        return Err(raise_exception(
+        return Err(make_exception(
             py,
             "InvalidProxyURL",
             "Please check proxy URL. It is malformed and could be missing the host.".to_string(),
@@ -481,7 +485,7 @@ fn validate_proxy_url(py: Python<'_>, proxy_url: &str) -> PyResult<()> {
     };
 
     if host.is_empty() {
-        return Err(raise_exception(
+        return Err(make_exception(
             py,
             "InvalidProxyURL",
             "Please check proxy URL. It is malformed and could be missing the host.".to_string(),
@@ -768,7 +772,7 @@ impl Session {
                     Err(_) => {
                         // reqwest couldn't parse the proxy URL.
                         return Python::attach(|py| {
-                            Err(raise_exception(
+                            Err(make_exception(
                                 py,
                                 "ProxyError",
                                 format!(
@@ -811,8 +815,9 @@ impl Session {
 
         // Release the GIL so Python-based servers (httpbin etc.) can process
         Python::attach(|py| {
-            py.detach(|| request.send())
-                .map_err(|e| map_reqwest_error(py, e, had_explicit_connect_timeout, has_proxies))
+            py.detach(|| request.send()).map_err(|e| {
+                map_reqwest_error(py, e, had_explicit_connect_timeout, has_proxies, None)
+            })
         })
     }
 
