@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::LazyLock;
 
 // ============================================================================
 // LookupDict — Dictionary lookup object for status codes
@@ -30,20 +31,15 @@ impl LookupDict {
         format!("<lookup '{}'>", self.name.as_deref().unwrap_or(""))
     }
 
-    fn __getattr__(&self, py: Python<'_>, key: &str) -> Py<PyAny> {
+    fn __getattr__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         if key == "name" {
-            return self
-                .name
-                .clone()
-                .into_pyobject(py)
-                .expect("name into_pyobject failed")
-                .into_any()
-                .unbind();
+            return Ok(self.name.clone().into_pyobject(py)?.into_any().unbind());
         }
-        self.data
+        Ok(self
+            .data
             .get(key)
             .map(|v| v.clone_ref(py))
-            .unwrap_or_else(|| py.None())
+            .unwrap_or_else(|| py.None()))
     }
 
     fn __setattr__(&mut self, key: String, value: Bound<'_, PyAny>) {
@@ -212,24 +208,23 @@ fn build_status_map() -> HashMap<String, i32> {
     map
 }
 
+/// Cached status map — built once, reused across calls.
+static STATUS_MAP: LazyLock<HashMap<String, i32>> = LazyLock::new(build_status_map);
+
 /// Construct a pre-populated `LookupDict` with all HTTP status code mappings.
 #[pyfunction]
-pub fn _init_status_codes() -> LookupDict {
+pub fn _init_status_codes() -> PyResult<LookupDict> {
     let mut codes = LookupDict::new(Some("status_codes".to_string()));
-    let status_map = build_status_map();
 
     Python::attach(|py| {
-        for (key, code) in &status_map {
-            let code_obj: Py<PyAny> = code
-                .into_pyobject(py)
-                .expect("i32 into_pyobject failed")
-                .into_any()
-                .unbind();
+        for (key, code) in STATUS_MAP.iter() {
+            let code_obj: Py<PyAny> = code.into_pyobject(py)?.into_any().unbind();
             codes.data.insert(key.clone(), code_obj);
         }
-    });
+        Ok::<(), PyErr>(())
+    })?;
 
-    codes
+    Ok(codes)
 }
 
 // ============================================================================
@@ -1193,38 +1188,45 @@ pub fn merge_setting(
         return Ok(request_setting.clone().unbind());
     }
     // Case 4: Both are Mappings → merge
-    // CaseInsensitiveDict fast path: when BOTH are CID, merge using the Rust store directly
-    if let (Ok(session_cid), Ok(request_cid)) = (
-        session_setting.cast::<crate::case_insensitive_dict::CaseInsensitiveDict>(),
-        request_setting.cast::<crate::case_insensitive_dict::CaseInsensitiveDict>(),
-    ) {
-        let mut merged = crate::case_insensitive_dict::CaseInsensitiveDict::new_empty();
-        // First: iterate session's items
-        {
-            let session_ref = session_cid.borrow();
-            for (orig_key, val) in session_ref.iter_items() {
-                merged.set_item(py, orig_key, val.bind(py).clone())?;
+    // CaseInsensitiveDict fast path: only when dict_class is explicitly CaseInsensitiveDict
+    let is_cid_class = dict_class.is_some_and(|dc| {
+        dc.getattr("__name__")
+            .and_then(|n| n.extract::<String>())
+            .is_ok_and(|name| name == "CaseInsensitiveDict")
+    });
+    if is_cid_class {
+        if let (Ok(session_cid), Ok(request_cid)) = (
+            session_setting.cast::<crate::case_insensitive_dict::CaseInsensitiveDict>(),
+            request_setting.cast::<crate::case_insensitive_dict::CaseInsensitiveDict>(),
+        ) {
+            let mut merged = crate::case_insensitive_dict::CaseInsensitiveDict::new_empty();
+            // First: iterate session's items
+            {
+                let session_ref = session_cid.borrow();
+                for (orig_key, val) in session_ref.iter_items() {
+                    merged.set_item(py, orig_key, val.bind(py).clone())?;
+                }
             }
-        }
-        // Then: overlay request's items
-        {
-            let request_ref = request_cid.borrow();
-            for (orig_key, val) in request_ref.iter_items() {
-                merged.set_item(py, orig_key, val.bind(py).clone())?;
+            // Then: overlay request's items
+            {
+                let request_ref = request_cid.borrow();
+                for (orig_key, val) in request_ref.iter_items() {
+                    merged.set_item(py, orig_key, val.bind(py).clone())?;
+                }
             }
+            // Prune entries where value is None
+            let none_keys: Vec<String> = merged
+                .iter_items()
+                .filter(|(_, val)| val.bind(py).is_none())
+                .map(|(key, _)| key.to_lowercase())
+                .collect();
+            // Create the Python object, then delete None-valued keys via its __delitem__
+            let merged_obj = pyo3::Py::new(py, merged)?;
+            for key in &none_keys {
+                merged_obj.bind(py).call_method1("__delitem__", (key,))?;
+            }
+            return Ok(merged_obj.into_any());
         }
-        // Prune entries where value is None
-        let none_keys: Vec<String> = merged
-            .iter_items()
-            .filter(|(_, val)| val.bind(py).is_none())
-            .map(|(key, _)| key.to_lowercase())
-            .collect();
-        // Create the Python object, then delete None-valued keys via its __delitem__
-        let merged_obj = pyo3::Py::new(py, merged)?;
-        for key in &none_keys {
-            merged_obj.bind(py).call_method1("__delitem__", (key,))?;
-        }
-        return Ok(merged_obj.into_any());
     }
     // Generic path: for other Mappings
     let dict_cls = match dict_class {
@@ -2059,7 +2061,7 @@ mod tests {
 
     #[test]
     fn test_build_status_map_keys() {
-        let map = build_status_map();
+        let map = &*STATUS_MAP;
         // Check that data was populated
         assert!(map.contains_key("ok"));
         assert!(map.contains_key("OK"));
@@ -2075,7 +2077,7 @@ mod tests {
 
     #[test]
     fn test_build_status_map_values() {
-        let map = build_status_map();
+        let map = &*STATUS_MAP;
         assert_eq!(map.get("ok"), Some(&200));
         assert_eq!(map.get("OK"), Some(&200));
         assert_eq!(map.get("not_found"), Some(&404));
@@ -2090,5 +2092,101 @@ mod tests {
         assert_eq!(map.get("found"), Some(&302));
         assert_eq!(map.get("see_other"), Some(&303));
         assert_eq!(map.get("bad_gateway"), Some(&502));
+    }
+
+    // -- split_comma_angle edge cases (#80) --
+
+    #[test]
+    fn test_split_comma_angle_empty() {
+        let result = split_comma_angle("");
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn test_split_comma_angle_comma_inside_angles() {
+        // Comma inside < > should NOT split
+        let result = split_comma_angle("<https://example.com/a,b>; rel=\"next\"");
+        assert_eq!(result.len(), 1);
+    }
+
+    // -- dotted_netmask edge cases (#80) --
+
+    #[test]
+    fn test_dotted_netmask_zero() {
+        assert_eq!(dotted_netmask_inner(0).unwrap(), "0.0.0.0");
+    }
+
+    #[test]
+    fn test_dotted_netmask_32() {
+        assert_eq!(dotted_netmask_inner(32).unwrap(), "255.255.255.255");
+    }
+
+    #[test]
+    fn test_dotted_netmask_invalid() {
+        assert!(dotted_netmask_inner(33).is_err());
+    }
+
+    // -- should_bypass_proxies_core edge cases (#80) --
+
+    #[test]
+    fn test_bypass_proxies_multiple_cidrs_match() {
+        assert!(should_bypass_proxies_core(
+            "192.168.1.100",
+            None,
+            true,
+            "10.0.0.0/8, 192.168.0.0/16"
+        ));
+    }
+
+    #[test]
+    fn test_bypass_proxies_multiple_cidrs_no_match() {
+        assert!(!should_bypass_proxies_core(
+            "172.16.0.1",
+            None,
+            true,
+            "10.0.0.0/8, 192.168.0.0/16"
+        ));
+    }
+
+    #[test]
+    fn test_bypass_proxies_hostname_suffix_dotted() {
+        assert!(should_bypass_proxies_core(
+            "sub.example.com",
+            None,
+            false,
+            ".example.com"
+        ));
+    }
+
+    // -- guess_json_utf boundary tests (#80) --
+
+    #[test]
+    fn test_guess_json_utf_empty() {
+        // < 2 bytes returns utf-8 default
+        assert_eq!(guess_json_utf(&[]), Some("utf-8".to_string()));
+        assert_eq!(guess_json_utf(&[0x7B]), Some("utf-8".to_string()));
+    }
+
+    #[test]
+    fn test_guess_json_utf_null_byte_pattern() {
+        // 2 bytes with a null — can't determine encoding
+        assert_eq!(guess_json_utf(&[0x00, 0x7B]), None);
+    }
+
+    #[test]
+    fn test_guess_json_utf_bom_utf8() {
+        assert_eq!(
+            guess_json_utf(&[0xEF, 0xBB, 0xBF, 0x7B]),
+            Some("utf-8-sig".to_string())
+        );
+    }
+
+    #[test]
+    fn test_guess_json_utf_pure_ascii() {
+        // No null bytes → utf-8
+        assert_eq!(
+            guess_json_utf(&[0x7B, 0x22, 0x6B, 0x22]),
+            Some("utf-8".to_string())
+        );
     }
 }
