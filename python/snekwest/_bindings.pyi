@@ -128,6 +128,7 @@ class Session:
     cert: Any  # str or tuple or None
     max_redirects: int
     trust_env: bool
+    timeout: Any  # None | float | tuple(float, float)
     adapters: Any  # OrderedDict
 
     def __init__(self) -> None: ...

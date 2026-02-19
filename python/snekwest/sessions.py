@@ -224,6 +224,7 @@ class Session(SessionRedirectMixin, _RustSession):
         "stream",
         "trust_env",
         "max_redirects",
+        "timeout",
     ]
 
     def __init__(self):
@@ -238,6 +239,11 @@ class Session(SessionRedirectMixin, _RustSession):
     def __setstate__(self, state):
         for attr, value in state.items():
             setattr(self, attr, value)
+
+    def request(self, method, url, **kwargs):
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = self.timeout
+        return super().request(method, url, **kwargs)
 
 
 def session():

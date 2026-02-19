@@ -119,12 +119,18 @@ pub struct RawResponseData {
 // Response — the Python-facing pyclass
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq)]
+enum ResponseBodyState {
+    Pending,   // Not yet read
+    Streaming, // Iterator handed out, bytes not cached
+    Consumed,  // Fully read (content_bytes may or may not have data)
+}
+
 #[pyclass(dict)]
 pub struct Response {
     // Content state — Arc for cheap cloning in iter_content
+    body_state: ResponseBodyState,
     content_bytes: Option<Arc<Vec<u8>>>,
-    content_loaded: bool,
-    content_consumed: bool,
 
     // Core fields
     status_code: Option<u16>,
@@ -202,34 +208,37 @@ impl Response {
         }
 
         // 7. Build raw object + content state
-        let (content_bytes, content_loaded, content_consumed, raw) =
-            if let Some(streaming) = data.streaming_inner {
-                // Streaming: wrap in StreamingRawResponse
-                let streaming_hdrs_map: HashMap<String, String> = data
-                    .streaming_headers
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                let sb = Py::new(py, StreamingBody::new(streaming, streaming_hdrs_map))?;
-                let streaming_cls = py
-                    .import("snekwest.models")?
-                    .getattr("StreamingRawResponse")?;
-                let raw = streaming_cls.call1((&sb, &headers_dict, &msg))?;
-                (None, false, false, Some(raw.unbind()))
-            } else {
-                // Non-streaming: BytesIO with _original_response
-                let io_mod = py.import("io")?;
-                let bio = io_mod
-                    .getattr("BytesIO")?
-                    .call1((PyBytes::new(py, &data.body),))?;
-                bio.setattr("headers", &headers_dict)?;
-                let ns_cls = py.import("types")?.getattr("SimpleNamespace")?;
-                let ns_kwargs = PyDict::new(py);
-                ns_kwargs.set_item("msg", &msg)?;
-                let fake_resp = ns_cls.call((), Some(&ns_kwargs))?;
-                bio.setattr("_original_response", &fake_resp)?;
-                (Some(Arc::new(data.body)), true, true, Some(bio.unbind()))
-            };
+        let (body_state, content_bytes, raw) = if let Some(streaming) = data.streaming_inner {
+            // Streaming: wrap in StreamingRawResponse
+            let streaming_hdrs_map: HashMap<String, String> = data
+                .streaming_headers
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let sb = Py::new(py, StreamingBody::new(streaming, streaming_hdrs_map))?;
+            let streaming_cls = py
+                .import("snekwest.models")?
+                .getattr("StreamingRawResponse")?;
+            let raw = streaming_cls.call1((&sb, &headers_dict, &msg))?;
+            (ResponseBodyState::Pending, None, Some(raw.unbind()))
+        } else {
+            // Non-streaming: BytesIO with _original_response
+            let io_mod = py.import("io")?;
+            let bio = io_mod
+                .getattr("BytesIO")?
+                .call1((PyBytes::new(py, &data.body),))?;
+            bio.setattr("headers", &headers_dict)?;
+            let ns_cls = py.import("types")?.getattr("SimpleNamespace")?;
+            let ns_kwargs = PyDict::new(py);
+            ns_kwargs.set_item("msg", &msg)?;
+            let fake_resp = ns_cls.call((), Some(&ns_kwargs))?;
+            bio.setattr("_original_response", &fake_resp)?;
+            (
+                ResponseBodyState::Consumed,
+                Some(Arc::new(data.body)),
+                Some(bio.unbind()),
+            )
+        };
 
         // 8. Build request PreparedRequest
         let prep_cls = py.import("snekwest.models")?.getattr("PreparedRequest")?;
@@ -260,9 +269,8 @@ impl Response {
             .map(|r| PyString::new(py, &r).into_any().unbind());
 
         Ok(Response {
+            body_state,
             content_bytes,
-            content_loaded,
-            content_consumed,
             status_code: Some(data.status),
             url_inner: Some(data.url),
             headers_inner: Some(cid),
@@ -280,18 +288,19 @@ impl Response {
 
     /// Internal: load content from raw if not already loaded.
     fn ensure_content_loaded(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.content_loaded {
-            return Ok(());
-        }
-        if self.content_consumed {
-            return Err(PyRuntimeError::new_err(
-                "The content for this response was already consumed",
-            ));
+        match self.body_state {
+            ResponseBodyState::Consumed => return Ok(()),
+            ResponseBodyState::Streaming => {
+                return Err(PyRuntimeError::new_err(
+                    "The content for this response was already consumed",
+                ));
+            }
+            ResponseBodyState::Pending => {}
         }
         let status = self.status_code.unwrap_or(0);
         if status == 0 || self.raw_inner.is_none() {
             self.content_bytes = None;
-            self.content_loaded = true;
+            self.body_state = ResponseBodyState::Consumed;
             return Ok(());
         }
         // Read all content from raw
@@ -316,7 +325,7 @@ impl Response {
             all_bytes.extend(chunk);
         }
         self.content_bytes = Some(Arc::new(all_bytes));
-        self.content_loaded = true;
+        self.body_state = ResponseBodyState::Consumed;
         Ok(())
     }
 
@@ -426,9 +435,8 @@ impl Response {
         let history = PyList::empty(py).into_any().unbind();
 
         Ok(Response {
+            body_state: ResponseBodyState::Pending,
             content_bytes: None,
-            content_loaded: false,
-            content_consumed: false,
             status_code: None,
             url_inner: None,
             headers_inner: Some(cid),
@@ -621,7 +629,7 @@ impl Response {
 
     #[getter(_content)]
     fn get__content(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if !self.content_loaded {
+        if self.body_state != ResponseBodyState::Consumed {
             return Ok(false.into_pyobject(py)?.to_owned().into_any().unbind());
         }
         match &self.content_bytes {
@@ -632,15 +640,15 @@ impl Response {
     #[setter(_content)]
     fn set__content(&mut self, _py: Python<'_>, v: Bound<'_, PyAny>) -> PyResult<()> {
         if v.is_instance_of::<pyo3::types::PyBool>() {
-            // _content = False means not loaded
-            self.content_loaded = false;
+            // _content = False means reset to pending
+            self.body_state = ResponseBodyState::Pending;
             self.content_bytes = None;
         } else if v.is_none() {
-            self.content_loaded = true;
+            self.body_state = ResponseBodyState::Consumed;
             self.content_bytes = None;
         } else {
             let bytes: Vec<u8> = v.extract()?;
-            self.content_loaded = true;
+            self.body_state = ResponseBodyState::Consumed;
             self.content_bytes = Some(Arc::new(bytes));
         }
         Ok(())
@@ -648,11 +656,26 @@ impl Response {
 
     #[getter(_content_consumed)]
     fn get__content_consumed(&self) -> bool {
-        self.content_consumed
+        self.body_state != ResponseBodyState::Pending
     }
     #[setter(_content_consumed)]
     fn set__content_consumed(&mut self, v: bool) {
-        self.content_consumed = v;
+        if v {
+            if self.body_state == ResponseBodyState::Pending {
+                self.body_state = ResponseBodyState::Streaming;
+            }
+        } else {
+            self.body_state = ResponseBodyState::Pending;
+        }
+    }
+
+    #[getter(_body_state)]
+    fn get__body_state(&self) -> &str {
+        match self.body_state {
+            ResponseBodyState::Pending => "pending",
+            ResponseBodyState::Streaming => "streaming",
+            ResponseBodyState::Consumed => "consumed",
+        }
     }
 
     // -- Computed properties --
@@ -660,7 +683,6 @@ impl Response {
     #[getter]
     fn content(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.ensure_content_loaded(py)?;
-        self.content_consumed = true;
         match &self.content_bytes {
             Some(bytes) => Ok(PyBytes::new(py, bytes).into_any().unbind()),
             None => Ok(py.None()),
@@ -670,7 +692,6 @@ impl Response {
     #[getter]
     fn text(&mut self, py: Python<'_>) -> PyResult<String> {
         self.ensure_content_loaded(py)?;
-        self.content_consumed = true;
         self.decode_text(py)
     }
 
@@ -730,7 +751,6 @@ impl Response {
     #[getter]
     fn apparent_encoding(&mut self, py: Python<'_>) -> PyResult<String> {
         self.ensure_content_loaded(py)?;
-        self.content_consumed = true;
         let bytes = self
             .content_bytes
             .as_ref()
@@ -771,7 +791,6 @@ impl Response {
     #[pyo3(signature = (**kwargs))]
     fn json(&mut self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         self.ensure_content_loaded(py)?;
-        self.content_consumed = true;
 
         let bytes: &[u8] = self
             .content_bytes
@@ -863,7 +882,7 @@ impl Response {
         let cs: Option<usize> = chunk_size.map(|n| n as usize);
 
         // Check StreamConsumedError
-        if self.content_consumed && !self.content_loaded {
+        if self.body_state == ResponseBodyState::Streaming {
             let exc = py
                 .import("snekwest.exceptions")?
                 .getattr("StreamConsumedError")?;
@@ -871,7 +890,7 @@ impl Response {
         }
 
         // Build ContentIterator
-        let iter = if self.content_consumed {
+        let iter = if self.body_state == ResponseBodyState::Consumed {
             // Content already loaded — iterate over cached bytes
             ContentIterator {
                 content: self.content_bytes.clone(),
@@ -881,9 +900,9 @@ impl Response {
                 done: false,
             }
         } else {
-            // Stream from raw — mark consumed eagerly so a second
+            // Stream from raw — mark streaming eagerly so a second
             // iter_content() call raises StreamConsumedError.
-            self.content_consumed = true;
+            self.body_state = ResponseBodyState::Streaming;
             ContentIterator {
                 content: None,
                 pos: 0,
@@ -934,7 +953,7 @@ impl Response {
     }
 
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        if !self.content_consumed {
+        if self.body_state == ResponseBodyState::Pending {
             if let Some(raw) = &self.raw_inner {
                 let _ = raw.bind(py).call_method0("close");
             }
@@ -1418,5 +1437,38 @@ mod tests {
             let chunk = iter.__next__(py).unwrap();
             assert!(chunk.is_none());
         });
+    }
+
+    // -- ResponseBodyState tests --
+
+    #[test]
+    fn test_body_state_default_is_pending() {
+        let state = ResponseBodyState::Pending;
+        assert_eq!(state, ResponseBodyState::Pending);
+        assert_ne!(state, ResponseBodyState::Streaming);
+        assert_ne!(state, ResponseBodyState::Consumed);
+    }
+
+    #[test]
+    fn test_body_state_transitions() {
+        let mut state = ResponseBodyState::Pending;
+        // Pending -> Streaming
+        state = ResponseBodyState::Streaming;
+        assert_eq!(state, ResponseBodyState::Streaming);
+        // Streaming stays Streaming
+        assert_ne!(state, ResponseBodyState::Pending);
+        // Reset to Pending
+        state = ResponseBodyState::Pending;
+        assert_eq!(state, ResponseBodyState::Pending);
+        // Pending -> Consumed
+        state = ResponseBodyState::Consumed;
+        assert_eq!(state, ResponseBodyState::Consumed);
+    }
+
+    #[test]
+    fn test_body_state_clone() {
+        let state = ResponseBodyState::Consumed;
+        let cloned = state.clone();
+        assert_eq!(state, cloned);
     }
 }
