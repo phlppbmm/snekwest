@@ -1,7 +1,30 @@
 """Convenience HTTP methods (get, post, put, etc.) for snekwest."""
 
+import atexit
+import threading
+
 from . import sessions
 from .models import Response
+
+_thread_local = threading.local()
+
+
+def _cleanup_session(session):
+    """Defensively close a session, ignoring any errors."""
+    try:
+        session.close()
+    except Exception:
+        pass
+
+
+def _get_session():
+    """Return a per-thread singleton Session, creating it lazily if needed."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = sessions.Session()
+        _thread_local.session = session
+        atexit.register(_cleanup_session, session)
+    return session
 
 
 def request(method, url, **kwargs) -> Response:
@@ -39,11 +62,9 @@ def request(method, url, **kwargs) -> Response:
     :rtype: Response
     """
 
-    # By using the 'with' statement we are sure the session is closed, thus we
-    # avoid leaving sockets open which can trigger a ResourceWarning in some
-    # cases, and look like a memory leak in others.
-    with sessions.Session() as session:
-        return session.request(method=method, url=url, **kwargs)
+    session = _get_session()
+    session.cookies.clear()
+    return session.request(method=method, url=url, **kwargs)
 
 
 def get(url: str, params=None, **kwargs) -> Response:
