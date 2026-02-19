@@ -528,6 +528,8 @@ pub struct Session {
     #[pyo3(get, set)]
     pub trust_env: bool,
     #[pyo3(get, set)]
+    pub timeout: Py<PyAny>,
+    #[pyo3(get, set)]
     pub adapters: Py<PyAny>,
 }
 
@@ -1065,6 +1067,7 @@ impl Session {
             cert: py.None(),
             max_redirects: MAX_REDIRECTS,
             trust_env: true,
+            timeout: py.None(),
             adapters: py_adapters,
         })
     }
@@ -1657,6 +1660,9 @@ impl Session {
                     this.trust_env,
                 ))?;
                 kwargs.set_item("proxies", resolved)?;
+            }
+            if !kwargs.contains("timeout")? && !this.timeout.bind(py).is_none() {
+                kwargs.set_item("timeout", &this.timeout)?;
             }
         } // drop borrow
 
