@@ -918,6 +918,7 @@ impl Session {
             request_headers: req_headers,
             streaming_inner: streaming_inner_opt,
             streaming_headers: streaming_hdrs,
+            force_eager: !streaming,
         })
     }
 

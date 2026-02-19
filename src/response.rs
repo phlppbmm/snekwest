@@ -113,6 +113,9 @@ pub struct RawResponseData {
     pub request_headers: HashMap<String, String>,
     pub streaming_inner: Option<StreamingInner>,
     pub streaming_headers: Option<Vec<(String, String)>>,
+    /// Whether the body was eagerly loaded (true) or left as a stream (false).
+    /// Set by `do_request()` based on the `stream` parameter and content-length.
+    pub force_eager: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,5 +1473,52 @@ mod tests {
         let state = ResponseBodyState::Consumed;
         let cloned = state.clone();
         assert_eq!(state, cloned);
+    }
+
+    // -- RawResponseData force_eager tests (#121) --
+
+    #[test]
+    fn test_raw_response_data_force_eager_true() {
+        let data = RawResponseData {
+            status: 200,
+            url: "http://example.com".to_string(),
+            headers: vec![],
+            body: vec![1, 2, 3],
+            elapsed_ms: 10.0,
+            history: vec![],
+            cookies: HashMap::new(),
+            reason: Some("OK".to_string()),
+            is_redirect: false,
+            method: "GET".to_string(),
+            request_url: "http://example.com".to_string(),
+            request_headers: HashMap::new(),
+            streaming_inner: None,
+            streaming_headers: None,
+            force_eager: true,
+        };
+        assert!(data.force_eager);
+        assert!(data.streaming_inner.is_none());
+    }
+
+    #[test]
+    fn test_raw_response_data_force_eager_false() {
+        let data = RawResponseData {
+            status: 200,
+            url: "http://example.com".to_string(),
+            headers: vec![],
+            body: vec![],
+            elapsed_ms: 10.0,
+            history: vec![],
+            cookies: HashMap::new(),
+            reason: Some("OK".to_string()),
+            is_redirect: false,
+            method: "GET".to_string(),
+            request_url: "http://example.com".to_string(),
+            request_headers: HashMap::new(),
+            streaming_inner: None,
+            streaming_headers: None,
+            force_eager: false,
+        };
+        assert!(!data.force_eager);
     }
 }
