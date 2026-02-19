@@ -1454,6 +1454,14 @@ impl Session {
         let prep = slf.borrow().prepare_request(py, &req)?;
         let prep_bound = prep.bind(py);
 
+        // Dispatch pre_request hook (informational — return value discarded)
+        {
+            let hooks_mod = py.import("snekwest.hooks")?;
+            let dispatch_hook_fn = hooks_mod.getattr("dispatch_hook")?;
+            let prep_hooks = prep_bound.getattr("hooks")?;
+            dispatch_hook_fn.call1(("pre_request", &prep_hooks, prep_bound))?;
+        }
+
         let py_proxies = proxies.unwrap_or_else(|| PyDict::new(py).into_any().unbind());
         let settings = slf.borrow().merge_environment_settings(
             py,
@@ -1683,14 +1691,37 @@ impl Session {
         // Get hooks from request
         let hooks = request.getattr(py, "hooks")?;
 
+        // Import hooks module once for all dispatches in send()
+        let hooks_mod = py.import("snekwest.hooks")?;
+        let dispatch_hook = hooks_mod.getattr("dispatch_hook")?;
+
         // Get adapter and send
         let req_url: String = request.getattr(py, "url")?.extract(py)?;
         let adapter = slf.borrow().get_adapter(py, req_url)?;
 
+        // Dispatch pre_send hook (informational — return value discarded)
+        dispatch_hook.call(("pre_send", &hooks, &request), Some(&kwargs))?;
+
         let start = std::time::Instant::now();
-        let r = adapter
+        let r = match adapter
             .bind(py)
-            .call_method("send", (&request,), Some(&kwargs))?;
+            .call_method("send", (&request,), Some(&kwargs))
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Dispatch on_error hook — if a hook returns a different non-None
+                // value (i.e. a replacement response), use it instead of re-raising.
+                // When no hooks are registered, dispatch_hook returns the original
+                // hook_data unchanged, so we compare identity to detect that case.
+                let err_obj = e.value(py);
+                let result = dispatch_hook.call1(("on_error", &hooks, err_obj))?;
+                if !result.is_none() && !result.is(err_obj) {
+                    result
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         let elapsed_secs = start.elapsed().as_secs_f64();
         let datetime = py.import("datetime")?;
         let timedelta = datetime.getattr("timedelta")?;
@@ -1700,8 +1731,6 @@ impl Session {
         r.setattr("elapsed", elapsed_td)?;
 
         // Dispatch response hooks
-        let hooks_mod = py.import("snekwest.hooks")?;
-        let dispatch_hook = hooks_mod.getattr("dispatch_hook")?;
         let r = dispatch_hook.call(("response", &hooks, &r), Some(&kwargs))?;
 
         // Extract cookies from history into Rust CookieStore, then sync to Python jar

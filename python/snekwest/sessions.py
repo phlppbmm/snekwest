@@ -64,11 +64,16 @@ from ._bindings import should_strip_auth as _should_strip_auth  # noqa: F811
 from ._bindings import rebuild_method as _rebuild_method
 
 
+def _hooks_are_empty(hooks):
+    """Check if all hook lists in a hooks dict are empty."""
+    return hooks is None or all(v == [] for v in hooks.values())
+
+
 def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
     """Properly merges both requests and session hooks."""
-    if session_hooks is None or session_hooks.get("response") == []:
+    if _hooks_are_empty(session_hooks):
         return request_hooks
-    if request_hooks is None or request_hooks.get("response") == []:
+    if _hooks_are_empty(request_hooks):
         return session_hooks
     return merge_setting(request_hooks, session_hooks, dict_class)
 
@@ -164,6 +169,7 @@ class SessionRedirectMixin:
                     self._extract_cookies_to_session(prepared_request, resp.raw)
                 else:
                     extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
+                resp = dispatch_hook("on_redirect", req.hooks, resp)
                 url = self.get_redirect_target(resp)
                 yield resp
 
