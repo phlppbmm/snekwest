@@ -6,11 +6,29 @@ This module provides the capabilities for the hooks system.
 
 Available hooks:
 
+``pre_request``:
+    Called after prepare_request() in Session.request(), before sending.
+    The hook receives the PreparedRequest as hook_data.
+
+``pre_send``:
+    Called in Session.send() just before the adapter sends the request.
+    The hook receives the PreparedRequest as hook_data.
+
 ``response``:
     The response generated from a Request.
+
+``on_redirect``:
+    Called during redirect resolution, after each intermediate response.
+    The hook receives the Response as hook_data.
+
+``on_error``:
+    Called when adapter.send() raises an exception.
+    The hook receives the exception as hook_data.
+    If the hook returns a non-None value, it is used as the response
+    instead of re-raising the exception.
 """
 
-HOOKS = ["response"]
+HOOKS = ["pre_request", "pre_send", "response", "on_redirect", "on_error"]
 
 
 def default_hooks():

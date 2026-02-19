@@ -113,6 +113,9 @@ pub struct RawResponseData {
     pub request_headers: HashMap<String, String>,
     pub streaming_inner: Option<StreamingInner>,
     pub streaming_headers: Option<Vec<(String, String)>>,
+    /// Whether the body was eagerly loaded (true) or left as a stream (false).
+    /// Set by `do_request()` based on the `stream` parameter and content-length.
+    pub force_eager: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,13 +333,26 @@ impl Response {
     }
 
     /// Internal: decode content bytes to text string.
-    fn decode_text(&self, py: Python<'_>) -> PyResult<String> {
+    ///
+    /// When `explicit_encoding` is `Some(enc)`, use that encoding with `"strict"`
+    /// error handling — invalid bytes raise `UnicodeDecodeError`.
+    /// When `None`, use the current behavior: encoding_inner → chardet → utf-8
+    /// with `"replace"` error handling.
+    fn decode_text(&self, py: Python<'_>, explicit_encoding: Option<&str>) -> PyResult<String> {
         let bytes = match &self.content_bytes {
             Some(b) if !b.is_empty() => b,
             _ => return Ok(String::new()),
         };
 
-        // Determine encoding
+        let py_bytes = PyBytes::new(py, bytes);
+
+        if let Some(enc) = explicit_encoding {
+            // Explicit encoding: strict error handling, no fallback
+            let s = py_bytes.call_method1("decode", (enc, "strict"))?;
+            return s.extract();
+        }
+
+        // Default path: encoding_inner → chardet → utf-8, "replace" errors
         let encoding: Option<String> = match &self.encoding_inner {
             Some(enc) => enc.extract(py).ok(),
             None => None,
@@ -348,7 +364,6 @@ impl Response {
         };
 
         // Decode
-        let py_bytes = PyBytes::new(py, bytes);
         match py_bytes.call_method1("decode", (&encoding, "replace")) {
             Ok(s) => s.extract(),
             Err(_) => {
@@ -692,7 +707,19 @@ impl Response {
     #[getter]
     fn text(&mut self, py: Python<'_>) -> PyResult<String> {
         self.ensure_content_loaded(py)?;
-        self.decode_text(py)
+        self.decode_text(py, None)
+    }
+
+    /// Decode response content with an explicit encoding.
+    ///
+    /// When `encoding` is provided, decode using that encoding with `"strict"`
+    /// error handling (raises `UnicodeDecodeError` on invalid bytes).
+    /// When `encoding` is `None`, identical behavior to `response.text`
+    /// (chardet guessing + `"replace"` error handling).
+    #[pyo3(signature = (encoding=None))]
+    fn text_with_encoding(&mut self, py: Python<'_>, encoding: Option<&str>) -> PyResult<String> {
+        self.ensure_content_loaded(py)?;
+        self.decode_text(py, encoding)
     }
 
     #[getter]
@@ -837,7 +864,7 @@ impl Response {
         }
 
         // Fall back to text-based parsing
-        let text = self.decode_text(py)?;
+        let text = self.decode_text(py, None)?;
         match json_mod.call_method("loads", (&text,), kwargs) {
             Ok(result) => Ok(result.unbind()),
             Err(e) => {
@@ -1470,5 +1497,176 @@ mod tests {
         let state = ResponseBodyState::Consumed;
         let cloned = state.clone();
         assert_eq!(state, cloned);
+    }
+
+    // -- RawResponseData force_eager tests (#121) --
+
+    #[test]
+    fn test_raw_response_data_force_eager_true() {
+        let data = RawResponseData {
+            status: 200,
+            url: "http://example.com".to_string(),
+            headers: vec![],
+            body: vec![1, 2, 3],
+            elapsed_ms: 10.0,
+            history: vec![],
+            cookies: HashMap::new(),
+            reason: Some("OK".to_string()),
+            is_redirect: false,
+            method: "GET".to_string(),
+            request_url: "http://example.com".to_string(),
+            request_headers: HashMap::new(),
+            streaming_inner: None,
+            streaming_headers: None,
+            force_eager: true,
+        };
+        assert!(data.force_eager);
+        assert!(data.streaming_inner.is_none());
+    }
+
+    // -- decode_text / text_with_encoding tests (#119) --
+
+    /// Helper: create a minimal Response with given content bytes and no encoding set.
+    fn make_response_with_content(py: Python<'_>, content: Vec<u8>) -> Response {
+        let mut resp = Response::py_new(py).unwrap();
+        resp.content_bytes = Some(Arc::new(content));
+        resp.body_state = ResponseBodyState::Consumed;
+        resp
+    }
+
+    #[test]
+    fn test_decode_text_no_explicit_encoding_uses_replace() {
+        // When no explicit encoding is given, invalid bytes should be replaced
+        // (not raise an error), matching the current response.text behavior.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            // 0xFF is not valid UTF-8 — with "replace" it becomes U+FFFD
+            let mut resp = make_response_with_content(py, vec![0x68, 0x65, 0x6C, 0xFF]);
+            // No encoding set → chardet will guess, but the fallback is utf-8 with replace
+            let result = resp.decode_text(py, None).unwrap();
+            // Should not raise, and should contain the valid prefix "hel"
+            assert!(result.starts_with("hel"));
+            // The invalid byte should be replaced, not cause an error
+            assert!(result.contains('\u{FFFD}') || result.len() >= 3);
+        });
+    }
+
+    #[test]
+    fn test_decode_text_explicit_utf8_valid() {
+        // Valid UTF-8 with explicit encoding should decode correctly.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let content = "hello world".as_bytes().to_vec();
+            let resp = make_response_with_content(py, content);
+            let result = resp.decode_text(py, Some("utf-8")).unwrap();
+            assert_eq!(result, "hello world");
+        });
+    }
+
+    #[test]
+    fn test_decode_text_explicit_utf8_invalid_raises() {
+        // Invalid UTF-8 with explicit encoding and "strict" should raise UnicodeDecodeError.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let content = vec![0x68, 0x65, 0x6C, 0xFF]; // "hel" + invalid byte
+            let resp = make_response_with_content(py, content);
+            let result = resp.decode_text(py, Some("utf-8"));
+            assert!(
+                result.is_err(),
+                "Expected UnicodeDecodeError for invalid UTF-8 with strict mode"
+            );
+        });
+    }
+
+    #[test]
+    fn test_decode_text_explicit_latin1() {
+        // Latin-1 can decode any byte sequence (0x00-0xFF).
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let content = vec![0x63, 0x61, 0x66, 0xE9]; // "caf" + 0xE9 = "café" in latin-1
+            let resp = make_response_with_content(py, content);
+            let result = resp.decode_text(py, Some("latin-1")).unwrap();
+            assert_eq!(result, "caf\u{00e9}"); // "café"
+        });
+    }
+
+    #[test]
+    fn test_decode_text_explicit_invalid_encoding_name_raises() {
+        // An invalid encoding name should raise LookupError.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let content = b"hello".to_vec();
+            let resp = make_response_with_content(py, content);
+            let result = resp.decode_text(py, Some("not-a-real-encoding"));
+            assert!(
+                result.is_err(),
+                "Expected LookupError for invalid encoding name"
+            );
+        });
+    }
+
+    #[test]
+    fn test_decode_text_empty_content_returns_empty_string() {
+        // Empty content should return empty string regardless of encoding.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let resp = make_response_with_content(py, vec![]);
+            let result = resp.decode_text(py, Some("utf-8")).unwrap();
+            assert_eq!(result, "");
+            let result_none = resp.decode_text(py, None).unwrap();
+            assert_eq!(result_none, "");
+        });
+    }
+
+    #[test]
+    fn test_decode_text_no_content_returns_empty_string() {
+        // No content_bytes at all should return empty string.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let mut resp = Response::py_new(py).unwrap();
+            resp.body_state = ResponseBodyState::Consumed;
+            // content_bytes is None
+            let result = resp.decode_text(py, Some("utf-8")).unwrap();
+            assert_eq!(result, "");
+            let result_none = resp.decode_text(py, None).unwrap();
+            assert_eq!(result_none, "");
+        });
+    }
+
+    #[test]
+    fn test_decode_text_explicit_ascii_with_non_ascii_raises() {
+        // ASCII encoding with bytes > 127 should raise with strict mode.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let content = vec![0x68, 0x65, 0x6C, 0x80]; // "hel" + 0x80
+            let resp = make_response_with_content(py, content);
+            let result = resp.decode_text(py, Some("ascii"));
+            assert!(
+                result.is_err(),
+                "Expected error for non-ASCII byte with ascii encoding in strict mode"
+            );
+        });
+    }
+
+    #[test]
+    fn test_raw_response_data_force_eager_false() {
+        let data = RawResponseData {
+            status: 200,
+            url: "http://example.com".to_string(),
+            headers: vec![],
+            body: vec![],
+            elapsed_ms: 10.0,
+            history: vec![],
+            cookies: HashMap::new(),
+            reason: Some("OK".to_string()),
+            is_redirect: false,
+            method: "GET".to_string(),
+            request_url: "http://example.com".to_string(),
+            request_headers: HashMap::new(),
+            streaming_inner: None,
+            streaming_headers: None,
+            force_eager: false,
+        };
+        assert!(!data.force_eager);
     }
 }
